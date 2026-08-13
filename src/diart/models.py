@@ -1,13 +1,23 @@
 from __future__ import annotations
 
 from abc import ABC
+from collections.abc import Callable
 from pathlib import Path
-from typing import Optional, Text, Union, Callable, List
 
 import numpy as np
 import torch
-import torch.nn as nn
 from requests import HTTPError
+from torch import nn
+
+# 兼容性 shim：部分环境（torchaudio 2.9+ 移除 list_audio_backends，或
+# C 扩展加载失败时）speechbrain 导入会因缺少该属性而崩溃。
+try:
+    import torchaudio
+
+    if not hasattr(torchaudio, "list_audio_backends"):
+        torchaudio.list_audio_backends = lambda: []
+except ImportError:
+    pass
 
 try:
     from pyannote.audio import Model
@@ -40,7 +50,7 @@ class PowersetAdapter(nn.Module):
 
 
 class PyannoteLoader:
-    def __init__(self, model_info, hf_token: Union[Text, bool, None] = True):
+    def __init__(self, model_info, hf_token: str | bool | None = True):
         super().__init__()
         self.model_info = model_info
         self.hf_token = hf_token
@@ -48,6 +58,16 @@ class PyannoteLoader:
     def __call__(self) -> Callable:
         try:
             model = Model.from_pretrained(self.model_info, use_auth_token=self.hf_token)
+            if model is None:
+                # pyannote.audio returns None when the model cannot be resolved
+                # on the Hugging Face hub (private/gated, missing, or not
+                # cached while offline) instead of raising an exception.
+                raise RuntimeError(
+                    f"Failed to load model '{self.model_info}' from Hugging Face. "
+                    "The model may be private/gated, the ID may be wrong, or it may "
+                    "not be present in the local cache while running offline. "
+                    "Log in with `huggingface-cli login` and/or re-run with --online."
+                )
             specs = getattr(model, "specifications", None)
             if specs is not None and specs.powerset:
                 model = PowersetAdapter(model)
@@ -60,7 +80,7 @@ class PyannoteLoader:
 
 
 class ONNXLoader:
-    def __init__(self, path: str | Path, input_names: List[str], output_name: str):
+    def __init__(self, path: str | Path, input_names: list[str], output_name: str):
         super().__init__()
         self.path = Path(path)
         self.input_names = input_names
@@ -71,7 +91,7 @@ class ONNXLoader:
 
 
 class ONNXModel:
-    def __init__(self, path: Path, input_names: List[str], output_name: str):
+    def __init__(self, path: Path, input_names: list[str], output_name: str):
         super().__init__()
         self.path = path
         self.input_names = input_names
@@ -113,7 +133,7 @@ class LazyModel(ABC):
     def __init__(self, loader: Callable[[], Callable]):
         super().__init__()
         self.get_model = loader
-        self.model: Optional[Callable] = None
+        self.model: Callable | None = None
 
     def is_in_memory(self) -> bool:
         """Return whether the model has been loaded into memory"""
@@ -146,8 +166,8 @@ class SegmentationModel(LazyModel):
 
     @staticmethod
     def from_pyannote(
-        model, use_hf_token: Union[Text, bool, None] = True
-    ) -> "SegmentationModel":
+        model, use_hf_token: str | bool | None = True
+    ) -> SegmentationModel:
         """
         Returns a `SegmentationModel` wrapping a pyannote model.
 
@@ -169,17 +189,17 @@ class SegmentationModel(LazyModel):
 
     @staticmethod
     def from_onnx(
-        model_path: Union[str, Path],
+        model_path: str | Path,
         input_name: str = "waveform",
         output_name: str = "segmentation",
-    ) -> "SegmentationModel":
+    ) -> SegmentationModel:
         assert IS_ONNX_AVAILABLE, "No ONNX installation found"
         return SegmentationModel(ONNXLoader(model_path, [input_name], output_name))
 
     @staticmethod
     def from_pretrained(
-        model, use_hf_token: Union[Text, bool, None] = True
-    ) -> "SegmentationModel":
+        model, use_hf_token: str | bool | None = True
+    ) -> SegmentationModel:
         if isinstance(model, str) or isinstance(model, Path):
             if Path(model).name.endswith(".onnx"):
                 return SegmentationModel.from_onnx(model)
@@ -202,9 +222,7 @@ class EmbeddingModel(LazyModel):
     """Minimal interface for an embedding model."""
 
     @staticmethod
-    def from_pyannote(
-        model, use_hf_token: Union[Text, bool, None] = True
-    ) -> "EmbeddingModel":
+    def from_pyannote(model, use_hf_token: str | bool | None = True) -> EmbeddingModel:
         """
         Returns an `EmbeddingModel` wrapping a pyannote model.
 
@@ -227,10 +245,10 @@ class EmbeddingModel(LazyModel):
 
     @staticmethod
     def from_onnx(
-        model_path: Union[str, Path],
-        input_names: List[str] | None = None,
+        model_path: str | Path,
+        input_names: list[str] | None = None,
         output_name: str = "embedding",
-    ) -> "EmbeddingModel":
+    ) -> EmbeddingModel:
         assert IS_ONNX_AVAILABLE, "No ONNX installation found"
         input_names = input_names or ["waveform", "weights"]
         loader = ONNXLoader(model_path, input_names, output_name)
@@ -238,15 +256,15 @@ class EmbeddingModel(LazyModel):
 
     @staticmethod
     def from_pretrained(
-        model, use_hf_token: Union[Text, bool, None] = True
-    ) -> "EmbeddingModel":
+        model, use_hf_token: str | bool | None = True
+    ) -> EmbeddingModel:
         if isinstance(model, str) or isinstance(model, Path):
             if Path(model).name.endswith(".onnx"):
                 return EmbeddingModel.from_onnx(model)
         return EmbeddingModel.from_pyannote(model, use_hf_token)
 
     def __call__(
-        self, waveform: torch.Tensor, weights: Optional[torch.Tensor] = None
+        self, waveform: torch.Tensor, weights: torch.Tensor | None = None
     ) -> torch.Tensor:
         """
         Call the forward pass of an embedding model with optional weights.

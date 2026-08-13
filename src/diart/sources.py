@@ -157,7 +157,7 @@ class MicrophoneAudioSource(AudioSource):
         # Use the lowest supported sample rate
         sample_rates = [16000, 32000, 44100, 48000]
         best_sample_rate = None
-        for sr in sample_rates:
+        for sr in sample_rates:  #sample rate
             try:
                 sd.check_input_settings(device=device, samplerate=sr)
             except Exception:

@@ -59,7 +59,9 @@ out/
 
 # mpeltonen/sbt-idea plugin
 .idea_modules/
-
+*.gif
+*.jpg
+*.png
 # JIRA plugin
 atlassian-ide-plugin.xml
 
@@ -235,3 +237,29 @@ dmypy.json
 cython_debug/
 
 # End of https://www.toptal.com/developers/gitignore/api/python,pycharm+all
+
+# ===== 项目专属：数据 / 日志 / 结果文件 =====
+
+# 测试音频数据与测试期望输出
+/test_spk/
+/expected_outputs/
+
+# 本地模型权重（HuggingFace 缓存副本）
+/models/
+
+# 交叉验证图片、运行输出、日志、pid 文件
+/fold/
+/output/
+/logs/
+/mock.pid
+*.pid
+
+# 实验结果（rttm/csv/json/png；docs 下的 .md 报告保留）
+/docs/results/
+
+# 工具与 IDE
+/.vscode/
+/.codegraph/
+
+# git 修复时的备份
+/.git.bak_*/

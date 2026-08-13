@@ -6,3 +6,12 @@ from .blocks import (
     VoiceActivityDetection,
     VoiceActivityDetectionConfig,
 )
+from . import verification
+from .verification import (
+    RegisteredSpeaker,
+    VoiceprintProvider,
+    DirectoryVoiceprints,
+    DBVoiceprints,
+    StreamingSpeakerVerifier,
+    VerifiedSpeaker,
+)

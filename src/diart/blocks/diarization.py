@@ -16,6 +16,7 @@ from .embedding import OverlapAwareSpeakerEmbedding
 from .segmentation import SpeakerSegmentation
 from .utils import Binarize
 from .. import models as m
+from .. import verification as verification
 
 
 class SpeakerDiarizationConfig(base.PipelineConfig):
@@ -35,6 +36,10 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         normalize_embedding_weights: bool = False,
         device: torch.device | None = None,
         sample_rate: int = 16000,
+        voiceprint_dir: str | None = None,
+        verify_threshold: float = 0.5,
+        verify_min_chunks: int = 3,
+        verify_ema_alpha: float = 0.3,
         **kwargs,
     ):
         # Default segmentation model is pyannote/segmentation
@@ -68,6 +73,12 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
+
+        # 流式说话人确认参数（voiceprint_dir 为 None 时关闭）
+        self.voiceprint_dir = voiceprint_dir
+        self.verify_threshold = verify_threshold
+        self.verify_min_chunks = verify_min_chunks
+        self.verify_ema_alpha = verify_ema_alpha
 
     @property
     def duration(self) -> float:
@@ -118,6 +129,32 @@ class SpeakerDiarization(base.Pipeline):
         )
         self.binarize = Binarize(self._config.tau_active)
 
+        # 流式说话人确认器（说话人确认功能）
+        self.verifier = None
+        self.verification: dict = {}
+        if self._config.voiceprint_dir is not None:
+            provider = verification.DirectoryVoiceprints(
+                self._config.voiceprint_dir,
+                self.embedding.embedding.model,
+                device=self._config.device,
+            )
+            voiceprints = provider.load()
+            if voiceprints:
+                self.verifier = verification.StreamingSpeakerVerifier(
+                    voiceprints,
+                    threshold=self._config.verify_threshold,
+                    min_chunks=self._config.verify_min_chunks,
+                    ema_alpha=self._config.verify_ema_alpha,
+                    max_speakers=self._config.max_speakers,
+                )
+                print(
+                    f"[说话人确认] 已加载 {len(voiceprints)} 个注册说话人, "
+                    f"阈值 {self._config.verify_threshold}, "
+                    f"确认所需连续chunk数 {self._config.verify_min_chunks}"
+                )
+            else:
+                print("[说话人确认] 警告: 声纹库为空，说话人确认已禁用")
+
         # Internal state, handle with care
         self.timestamp_shift = 0
         self.clustering = None
@@ -153,6 +190,9 @@ class SpeakerDiarization(base.Pipeline):
             self.config.max_speakers,
         )
         self.chunk_buffer, self.pred_buffer = [], []
+        if self.verifier is not None:
+            self.verifier.reset()
+        self.verification = {}
 
     def __call__(
         self, waveforms: Sequence[SlidingWindowFeature]
@@ -210,6 +250,22 @@ class SpeakerDiarization(base.Pipeline):
             agg_waveform = self.audio_aggregation(self.chunk_buffer)
             agg_prediction = self.pred_aggregation(self.pred_buffer)
             agg_prediction = self.binarize(agg_prediction)
+
+            # 流式说话人确认：匹配聚类质心 -> 重命名标签 -> 附确认信息
+            if self.verifier is not None and self.clustering.centers is not None:
+                self.verifier.update(
+                    self.clustering.centers, self.clustering.active_centers
+                )
+                agg_prediction = self.verifier.rename_annotation(agg_prediction)
+            self.verification = {
+                g_spk: {
+                    "name": v.name,
+                    "id": v.id,
+                    "similarity": v.similarity,
+                }
+                for g_spk, v in self.verifier.confirmed.items()
+            } if self.verifier is not None else {}
+            agg_prediction.speaker_verification = dict(self.verification)
 
             # Shift prediction timestamps if required
             if self.timestamp_shift != 0:

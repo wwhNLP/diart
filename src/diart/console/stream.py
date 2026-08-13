@@ -97,7 +97,39 @@ def run():
         action="store_true",
         help=f"{argdoc.NORMALIZE_EMBEDDING_WEIGHTS}. Defaults to False",
     )
+    parser.add_argument(
+        "--voiceprint-dir",
+        default=None,
+        type=str,
+        help="声纹库目录 (<dir>/<说话人姓名>/*.wav)。提供后启用流式说话人确认",
+    )
+    parser.add_argument(
+        "--verify-threshold",
+        default=0.5,
+        type=float,
+        help="声纹确认余弦相似度阈值（EER 校准值）。Defaults to 0.5",
+    )
+    parser.add_argument(
+        "--verify-min-chunks",
+        default=3,
+        type=int,
+        help="确认所需连续命中 chunk 数。Defaults to 3",
+    )
+    parser.add_argument(
+        "--verify-ema-alpha",
+        default=0.3,
+        type=float,
+        help="相似度 EMA 平滑系数。Defaults to 0.3",
+    )
+    parser.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="禁用流式说话人确认",
+    )
     args = parser.parse_args()
+    if not args.verify:
+        args.voiceprint_dir = None
 
     # Resolve device
     args.device = torch.device("cpu") if args.cpu else None
@@ -141,6 +173,23 @@ def run():
     inference.attach_observers(
         RTTMWriter(audio_source.uri, args.output / f"{audio_source.uri}.rttm")
     )
+
+    # 流式说话人确认事件打印（标签已重命名为真实人名）
+    printed_confirmations = set()
+
+    def print_confirmations(ann_wav):
+        ann = ann_wav[0]
+        info = getattr(ann, "speaker_verification", {})
+        for g_spk, v in info.items():
+            key = (g_spk, v["name"])
+            if key not in printed_confirmations:
+                printed_confirmations.add(key)
+                print(
+                    f"[声纹确认] speaker{g_spk} = {v['name']} "
+                    f"(相似度 {v['similarity']:.3f})"
+                )
+
+    inference.attach_hooks(print_confirmations)
     try:
         inference()
     except KeyboardInterrupt:

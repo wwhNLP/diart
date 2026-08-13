@@ -129,6 +129,59 @@ diart.stream microphone
 By default, diart runs a speaker diarization pipeline, equivalent to setting `--pipeline SpeakerDiarization`,
 but you can also set it to `--pipeline VoiceActivityDetection`. See `diart.stream -h` for more options.
 
+### 🗣️ Streaming speaker verification (声纹确认)
+
+In addition to diarization, diart can **confirm the identity of each speaker in real time**
+by matching its streaming voiceprint against a registered voiceprint library:
+
+```shell
+diart.stream /path/to/audio.wav --voiceprint-dir /path/to/voiceprints
+# /path/to/voiceprints must contain one folder per speaker:
+#   /path/to/voiceprints/王佳琪/*.wav
+#   /path/to/voiceprints/李笑康/*.wav
+```
+
+Every chunk, the pipeline computes cosine similarity between each active speaker's
+accumulated centroid and the registered voiceprints (same math as the
+reference project `ASR-stream-SPK-PY`, with an EER-calibrated threshold of 0.5
+default — see `scripts/calibrate_threshold.py`), smooths it with an EMA and confirms the name
+after `--verify-min-chunks` consecutive hits. Confirmed labels are renamed in the output
+(e.g. `speaker0` → `王佳琪`), **unregistered (unconfirmed) speakers keep their original
+`speakerX` label untouched**, and if a previously confirmed speaker's similarity drops
+below the threshold for `--verify-min-chunks` consecutive chunks, the confirmation is
+revoked and the label reverts to `speakerX`. The per-chunk confirmation state is
+attached to every output annotation as `annotation.speaker_verification`
+(`{speaker_idx: {name, similarity, id}}`).
+
+```shell
+# Additional options
+--verify-threshold 0.5    # cosine threshold (EER-calibrated, default 0.5)
+--verify-min-chunks 3     # chunks needed to confirm a name (default 3)
+--verify-ema-alpha 0.3    # EMA smoothing factor for the similarity (default 0.3)
+--no-verify               # disable verification
+```
+
+From python:
+
+```python
+from diart import SpeakerDiarization
+from diart.blocks import SpeakerDiarizationConfig
+
+pipeline = SpeakerDiarization(SpeakerDiarizationConfig(
+    voiceprint_dir="/path/to/voiceprints",  # enables verification
+    verify_threshold=0.5,
+    verify_min_chunks=3,
+    verify_ema_alpha=0.3,
+))
+# streaming outputs: confirmed labels are real names, and each annotation
+# carries `.speaker_verification` with per-speaker name & similarity
+```
+
+The voiceprint library can also be loaded from a PostgreSQL database (compatible with the
+reference project's 256-dim schema) via `diart.verification.DBVoiceprints`.
+Voiceprints are extracted with the pipeline's own embedding model, so they always live
+in the same vector space (recommended: `pyannote/wespeaker-voxceleb-resnet34-LM`, 256 dims).
+
 ### From python
 
 Use `StreamingInference` to run a pipeline on an audio source and write the results to disk:

@@ -1,8 +1,8 @@
 import logging
-from multiprocessing import Pool, freeze_support, RLock, current_process
+from collections.abc import Callable
+from multiprocessing import Pool, RLock, current_process, freeze_support
 from pathlib import Path
 from traceback import print_exc
-from typing import Union, Text, Optional, Callable, Tuple, List
 
 import numpy as np
 import pandas as pd
@@ -15,10 +15,9 @@ from pyannote.metrics.base import BaseMetric
 from rx.core import Observer
 from tqdm import tqdm
 
-from . import blocks
+from . import blocks, utils
 from . import operators as dops
 from . import sources as src
-from . import utils
 from .progress import ProgressBar, RichProgressBar, TQDMProgressBar
 from .sinks import PredictionAccumulator, StreamingPlot, WindowClosedException
 
@@ -60,7 +59,7 @@ class StreamingInference:
         do_profile: bool = True,
         do_plot: bool = False,
         show_progress: bool = True,
-        progress_bar: Optional[ProgressBar] = None,
+        progress_bar: ProgressBar | None = None,
     ):
         self.pipeline = pipeline
         self.source = source
@@ -71,6 +70,7 @@ class StreamingInference:
         self.accumulator = PredictionAccumulator(self.source.uri)
         self.unit = "chunk" if self.batch_size == 1 else "batch"
         self._observers = []
+        self._error: BaseException | None = None
 
         chunk_duration = self.pipeline.config.duration
         step_duration = self.pipeline.config.step
@@ -157,7 +157,7 @@ class StreamingInference:
             self._chrono.report()
 
     def attach_hooks(
-        self, *hooks: Callable[[Tuple[Annotation, SlidingWindowFeature]], None]
+        self, *hooks: Callable[[tuple[Annotation, SlidingWindowFeature]], None]
     ):
         """Attach hooks to the pipeline.
 
@@ -180,6 +180,7 @@ class StreamingInference:
         self._observers.extend(observers)
 
     def _handle_error(self, error: BaseException):
+        self._error = error
         # Compensate for Rx not always calling on_error
         for sink in self._observers:
             sink.on_error(error)
@@ -207,6 +208,7 @@ class StreamingInference:
         predictions: Annotation
             Speaker diarization pipeline predictions
         """
+        self._error = None
         if self.show_progress:
             self._pbar.start()
         config = self.pipeline.config
@@ -228,6 +230,8 @@ class StreamingInference:
         )
         # FIXME if read() isn't blocking, the prediction returned is empty
         self.source.read()
+        if self._error is not None:
+            raise self._error
         return self.accumulator.get_prediction()
 
 
@@ -267,9 +271,9 @@ class Benchmark:
 
     def __init__(
         self,
-        speech_path: Union[Text, Path],
-        reference_path: Optional[Union[Text, Path]] = None,
-        output_path: Optional[Union[Text, Path]] = None,
+        speech_path: str | Path,
+        reference_path: str | Path | None = None,
+        output_path: str | Path | None = None,
         show_progress: bool = True,
         show_report: bool = True,
         batch_size: int = 32,
@@ -295,7 +299,7 @@ class Benchmark:
         self.show_report = show_report
         self.batch_size = batch_size
 
-    def get_file_paths(self) -> List[Path]:
+    def get_file_paths(self) -> list[Path]:
         """Return the path for each file in the benchmark.
 
         Returns
@@ -358,9 +362,9 @@ class Benchmark:
 
     def evaluate(
         self,
-        predictions: List[Annotation],
+        predictions: list[Annotation],
         metric: BaseMetric,
-    ) -> Union[pd.DataFrame, List[Annotation]]:
+    ) -> pd.DataFrame | list[Annotation]:
         """If a reference path was provided,
         compute the diarization error rate of a list of predictions.
 
@@ -393,8 +397,8 @@ class Benchmark:
         self,
         pipeline_class: type,
         config: blocks.PipelineConfig,
-        metric: Optional[BaseMetric] = None,
-    ) -> Union[pd.DataFrame, List[Annotation]]:
+        metric: BaseMetric | None = None,
+    ) -> pd.DataFrame | list[Annotation]:
         """Run a given pipeline on a set of audio files.
         The internal state of the pipeline is reset before benchmarking.
 
@@ -458,7 +462,7 @@ class Parallelize:
         pipeline_class: type,
         config: blocks.PipelineConfig,
         filepath: Path,
-        description: Text,
+        description: str,
     ) -> Annotation:
         """Build and run a pipeline on a single file.
         Configure execution to show progress alongside parallel runs.
@@ -496,8 +500,8 @@ class Parallelize:
         self,
         pipeline_class: type,
         config: blocks.PipelineConfig,
-        metric: Optional[BaseMetric] = None,
-    ) -> Union[pd.DataFrame, List[Annotation]]:
+        metric: BaseMetric | None = None,
+    ) -> pd.DataFrame | list[Annotation]:
         """Run a given pipeline on a set of audio files in parallel.
         Each worker will build and run the pipeline on a different file.
 

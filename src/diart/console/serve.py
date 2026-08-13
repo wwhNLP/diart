@@ -1,19 +1,72 @@
 import argparse
+import os
 from pathlib import Path
+
+DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
+
+
+def _apply_environment(hf_endpoint: str, offline: bool) -> None:
+    """Configure model loading the same way as ``run_test.py``.
+
+    huggingface_hub / pyannote.audio / matplotlib read these variables at
+    import time, so this must run BEFORE ``from diart import ...`` below.
+    """
+    # Point the pyannote cache at the huggingface hub cache so downloaded
+    # models are reusable, including offline.
+    if "PYANNOTE_CACHE" not in os.environ:
+        hf_hub_cache = os.environ.get("HF_HUB_CACHE")
+        if hf_hub_cache is None:
+            hf_home = Path(
+                os.environ.get("HF_HOME", "~/.cache/huggingface")
+            ).expanduser()
+            hf_hub_cache = str(hf_home / "hub")
+        os.environ["PYANNOTE_CACHE"] = hf_hub_cache
+    # Avoid repeated matplotlib cache creation under a non-writable HOME.
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/diart-matplotlib")
+    os.environ["HF_ENDPOINT"] = hf_endpoint
+    if offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+    else:
+        os.environ.pop("HF_HUB_OFFLINE", None)
+
+
+# Pre-scan this script's own flags: they must be applied to the environment
+# before the libraries below are imported (they freeze env vars at import time).
+_pre_parser = argparse.ArgumentParser(add_help=False)
+_pre_parser.add_argument(
+    "--hf-endpoint",
+    default=os.environ.get("HF_ENDPOINT", DEFAULT_HF_ENDPOINT),
+    help=f"Hugging Face endpoint (default: {DEFAULT_HF_ENDPOINT})",
+)
+_pre_connectivity = _pre_parser.add_mutually_exclusive_group()
+_pre_connectivity.add_argument(
+    "--offline",
+    dest="offline",
+    action="store_true",
+    default=True,
+    help="Only use models already present in the Hugging Face cache (default).",
+)
+_pre_connectivity.add_argument(
+    "--online",
+    dest="offline",
+    action="store_false",
+    help="Contact the Hugging Face endpoint to download or update models.",
+)
+_pre_args, _ = _pre_parser.parse_known_args()
+_apply_environment(_pre_args.hf_endpoint, _pre_args.offline)
 
 import torch
 
-from diart import argdoc
+from diart import argdoc, utils
 from diart import models as m
 from diart import sources as src
-from diart import utils
 from diart.inference import StreamingInference
 from diart.sinks import RTTMWriter
 
 
 def run():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="0.0.0.0", type=str, help="Server host")
+    parser.add_argument("--host", default="localhost", type=str, help="Server host")
     parser.add_argument("--port", default=7007, type=int, help="Server port")
     parser.add_argument(
         "--pipeline",
@@ -23,9 +76,9 @@ def run():
     )
     parser.add_argument(
         "--segmentation",
-        default="pyannote/segmentation",
+        default="pyannote/segmentation-3.0",
         type=str,
-        help=f"{argdoc.SEGMENTATION}. Defaults to pyannote/segmentation",
+        help=f"{argdoc.SEGMENTATION}. Defaults to pyannote/segmentation-3.0",
     )
     parser.add_argument(
         "--embedding",
@@ -82,11 +135,66 @@ def run():
         help=f"{argdoc.HF_TOKEN}. Defaults to 'true' (required by pyannote)",
     )
     parser.add_argument(
+        "--hf-endpoint",
+        default=os.environ.get("HF_ENDPOINT", DEFAULT_HF_ENDPOINT),
+        type=str,
+        help=(
+            "Hugging Face endpoint. Applied before model libraries are imported "
+            f"(default: {DEFAULT_HF_ENDPOINT})"
+        ),
+    )
+    connectivity = parser.add_mutually_exclusive_group()
+    connectivity.add_argument(
+        "--offline",
+        dest="offline",
+        action="store_true",
+        default=True,
+        help="Only use models already present in the Hugging Face cache (default).",
+    )
+    connectivity.add_argument(
+        "--online",
+        dest="offline",
+        action="store_false",
+        help="Contact the Hugging Face endpoint to download or update models.",
+    )
+    parser.add_argument(
         "--normalize-embedding-weights",
         action="store_true",
         help=f"{argdoc.NORMALIZE_EMBEDDING_WEIGHTS}. Defaults to False",
     )
+    parser.add_argument(
+        "--voiceprint-dir",
+        default=None,
+        type=str,
+        help="声纹库目录 (<dir>/<说话人姓名>/*.wav)。提供后启用流式说话人确认",
+    )
+    parser.add_argument(
+        "--verify-threshold",
+        default=0.5,
+        type=float,
+        help="声纹确认余弦相似度阈值（EER 校准值）。Defaults to 0.5",
+    )
+    parser.add_argument(
+        "--verify-min-chunks",
+        default=3,
+        type=int,
+        help="确认所需连续命中 chunk 数。Defaults to 3",
+    )
+    parser.add_argument(
+        "--verify-ema-alpha",
+        default=0.3,
+        type=float,
+        help="相似度 EMA 平滑系数。Defaults to 0.3",
+    )
+    parser.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="禁用流式说话人确认",
+    )
     args = parser.parse_args()
+    if not args.verify:
+        args.voiceprint_dir = None
 
     # Resolve device
     args.device = torch.device("cpu") if args.cpu else None
