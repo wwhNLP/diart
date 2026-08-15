@@ -228,7 +228,9 @@ def run():
     audio_source = src.WebSocketAudioSource(config.sample_rate, args.host, args.port)
 
     # 流式说话人确认：双模式（verify/identify）+ 运行中 WS 控制切换
-    if pipeline.verifier is not None:
+    # 注意：非说话人确认管道（如 VoiceActivityDetection）没有 verifier 属性，
+    # 需用 getattr 守卫，否则 `--pipeline` 选择该类会启动即 AttributeError
+    if getattr(pipeline, "verifier", None) is not None:
         pipeline.verifier.set_mode(args.verify_mode)
 
         def _on_control(ctrl: dict):
@@ -238,7 +240,11 @@ def run():
                 pipeline.verifier.set_mode(mode)
                 print(f"[说话人确认] 运行中切换模式 -> {mode}", flush=True)
             elif ctype == "reload_voiceprints":
-                pipeline.reload_voiceprints()
+                reload_fn = getattr(pipeline, "reload_voiceprints", None)
+                if reload_fn is not None:
+                    reload_fn()
+                else:
+                    print("[说话人确认] 当前管道不支持声纹热重载", flush=True)
             else:
                 print(f"[说话人确认] 未知控制消息: {ctrl}", flush=True)
 

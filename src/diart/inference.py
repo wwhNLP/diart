@@ -230,7 +230,12 @@ class StreamingInference:
         )
         # FIXME if read() isn't blocking, the prediction returned is empty
         self.source.read()
-        if self._error is not None:
+        # 仅真实管道错误才重抛：WindowClosedException（关绘图窗口）与
+        # KeyboardInterrupt 在 _handle_error 中被视为正常终止，重抛会
+        # 变成未处理异常崩溃（do_plot=True 时关窗即触发）
+        if self._error is not None and not isinstance(
+            self._error, (WindowClosedException, KeyboardInterrupt)
+        ):
             raise self._error
         return self.accumulator.get_prediction()
 

@@ -101,36 +101,34 @@ def evaluate_meeting(
         show_progress=False,
     )
 
-    segments = []
-
-    def hook(ann_wav):
-        ann, _ = ann_wav
-        verifier = pipeline.verifier
-        pending = verifier.pending if verifier is not None else {}
-        confirmed = verifier.confirmed if verifier is not None else {}
-        for turn, _, label in ann.itertracks(yield_label=True):
-            if label.startswith("speaker"):
-                g = int(label.replace("speaker", ""))
-                sim = pending.get(g, (None, -1.0))[1]
-                is_confirmed = g in confirmed
-            else:
-                g = next(
-                    (k for k, vs in confirmed.items() if vs.name == label), -1
-                )
-                sim = pending.get(g, (None, -1.0))[1] if g >= 0 else -1.0
-                is_confirmed = g >= 0
-            segments.append(
-                {
-                    "start": turn.start * 1000,
-                    "end": turn.end * 1000,
-                    "label": label,
-                    "similarity": round(float(sim), 4),
-                    "confirmed": is_confirmed,
-                }
-            )
-
-    inference.attach_hooks(hook)
+    # 逐段明细基于累积预测（StreamingInference 返回的最终注解），而不是逐
+    # chunk 的 0.5s 切片注解：切片会把跨多个 chunk 的同一段重复计数，
+    # 虚增总段数/正确段/准确率并产生大量重复 CSV 行
     prediction = inference()
+    verifier = pipeline.verifier
+    pending = verifier.pending if verifier is not None else {}
+    confirmed = verifier.confirmed if verifier is not None else {}
+    segments = []
+    for turn, _, label in prediction.itertracks(yield_label=True):
+        if label.startswith("speaker"):
+            g = int(label.replace("speaker", ""))
+            sim = pending.get(g, (None, -1.0))[1]
+            is_confirmed = g in confirmed
+        else:
+            g = next(
+                (k for k, vs in confirmed.items() if vs.name == label), -1
+            )
+            sim = pending.get(g, (None, -1.0))[1] if g >= 0 else -1.0
+            is_confirmed = g >= 0
+        segments.append(
+            {
+                "start": turn.start * 1000,
+                "end": turn.end * 1000,
+                "label": label,
+                "similarity": round(float(sim), 4),
+                "confirmed": is_confirmed,
+            }
+        )
 
     # 导出原始 RTTM（流式预测本体：时间戳 + 标签，已确认段为人名）
     if out_dir is not None:
@@ -269,14 +267,19 @@ def main():
             json.dump(all_summaries[threshold], f, ensure_ascii=False, indent=2)
 
     # 多阈值对比表（与《技术报告》4.3(0) 同格式）
-    th_labels = {t: t for t in thresholds}
+    first_t = next(iter(all_summaries), None)
+    total_seg = (
+        sum(s["总段数"] for s in all_summaries[first_t].values())
+        if first_t is not None
+        else 0
+    )
     header = "| 会议 | " + " | ".join(f"{t}（{'EER' if t == '0.5' else '经验值' if t == '0.4' else 'FAR≤1%'}）" for t in thresholds) + " |"
     sep = "|" + "---|" * (len(thresholds) + 1)
     lines = ["# 流式说话人确认 — 多阈值对比（可复现输出）", "",
-             f"- 参数：delta_new=0.8, min_chunks=3, 5 会议 2,663 段，全部可复现",
+             f"- 参数：delta_new={args.delta_new}, min_chunks={args.min_chunks}, "
+             f"实际评估 {len(meetings)} 个会议 {total_seg} 段",
              f"- 逐段明细 CSV：`{out_root}/<阈值>/<会议>.csv`（预测标签/相似度EMA/是否确认/真值/错误类型）", "",
              header, sep]
-    totals = {}
     for m_name in meetings:
         row = [m_name]
         for t in thresholds:

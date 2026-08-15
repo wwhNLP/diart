@@ -85,7 +85,8 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         self.verify_min_chunks = verify_min_chunks
         self.verify_ema_alpha = verify_ema_alpha
         # 双模式：verify（确认，默认）/ identify（识别，open-set）
-        assert verify_mode in ("verify", "identify"), "verify_mode 只能是 verify / identify"
+        if verify_mode not in ("verify", "identify"):
+            raise ValueError(f"verify_mode 只能是 verify / identify，收到: {verify_mode!r}")
         self.verify_mode = verify_mode
         self.identify_min_similarity = identify_min_similarity
 
@@ -201,12 +202,37 @@ class SpeakerDiarization(base.Pipeline):
         self.timestamp_shift = shift
 
     def reload_voiceprints(self):
-        """热重载声纹库（主库 + 临时库重新扫描），保留已确认状态。"""
-        if self.verifier is None or self._voiceprint_provider is None:
+        """热重载声纹库（主库 + 临时库重新扫描），保留已确认状态。
+
+        支持惰性启用：启动时声纹库为空不创建 verifier，首次重载拿到声纹时
+        再构造；库被清空时禁用匹配（清空矩阵）。
+        """
+        if self._voiceprint_provider is None:
             print("[说话人确认] 未启用声纹确认，忽略重载请求")
             return
         self._voiceprint_provider.refresh()
         voiceprints = self._voiceprint_provider.load()
+        if self.verifier is None:
+            if not voiceprints:
+                print("[说话人确认] 警告: 声纹库为空，确认功能保持禁用")
+                return
+            # 惰性构造：库在启动后才有内容（如 web 上传首条声纹）
+            self.verifier = verification.StreamingSpeakerVerifier(
+                voiceprints,
+                threshold=self._config.verify_threshold,
+                min_chunks=self._config.verify_min_chunks,
+                ema_alpha=self._config.verify_ema_alpha,
+                max_speakers=self._config.max_speakers,
+                mode=self._config.verify_mode,
+                identify_min_similarity=self._config.identify_min_similarity,
+            )
+            print(
+                f"[说话人确认] 已加载 {len(voiceprints)} 个注册说话人, "
+                f"阈值 {self._config.verify_threshold}, "
+                f"确认所需连续chunk数 {self._config.verify_min_chunks}, "
+                f"模式 {self._config.verify_mode}"
+            )
+            return
         self.verifier.update_voiceprints(voiceprints)
 
     def reset(self):

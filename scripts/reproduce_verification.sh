@@ -15,16 +15,27 @@
 #   2. 模型已下载：models/segmentation-3.0、models/wespeaker-voxceleb-resnet34-LM
 #      （ModelScope: modelscope download --model pyannote/segmentation-3.0 --local_dir models/segmentation-3.0）
 #   3. 数据齐全：test_spk/说话人识别测试/{声纹库,拼接会议}
-#   4. 工作目录为项目根目录（含 src/）
+#   4. 可从任意目录调用（脚本自动定位项目根目录）
 # =============================================================================
 set -euo pipefail
 
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_DIR"
+
 THRESHOLDS="${1:-0.5}"
 OUT="docs/results/reproduce"
-PYTHON="${PYTHON:-/home/wwh/miniforge3/envs/diart/bin/python}"
+# 便携解释器：优先 $PYTHON 环境变量，其次 PATH 中的 python
+PYTHON="${PYTHON:-$(command -v python)}"
+
+# 阈值校验：非空、逗号分隔的 [0,1] 小数列表（避免跑完才在深处报 float() 错误）
+if ! [[ "${THRESHOLDS}" =~ ^0(\.[0-9]+)?(,0(\.[0-9]+)?)*$ ]]; then
+    echo "✗ 非法阈值列表: ${THRESHOLDS}（示例: 0.5 或 0.4,0.47,0.5）"
+    exit 1
+fi
 
 echo "=============================================="
 echo " 流式说话人确认 — 一键复现"
+echo " 项目目录: ${PROJECT_DIR}"
 echo " 阈值: ${THRESHOLDS}"
 echo " 输出: ${OUT}"
 echo "=============================================="
@@ -32,12 +43,18 @@ echo "=============================================="
 # ── 环境检查 ────────────────────────────────────────────────────────────────
 echo "[1/3] 检查环境..."
 command -v "${PYTHON}" >/dev/null 2>&1 || { echo "✗ 找不到 Python: ${PYTHON}（可用 PYTHON=/path/to/python 指定）"; exit 1; }
-for f in models/segmentation-3.0/pytorch_model.bin \
-         models/wespeaker-voxceleb-resnet34-LM/pytorch_model.bin; do
-    [ -f "$f" ] || { echo "✗ 缺少模型: $f（先用 ModelScope 下载）"; exit 1; }
+# 模型目录（pyannote Model.from_pretrained 需要完整目录，而非单个 pytorch_model.bin）
+for f in models/segmentation-3.0 \
+         models/wespeaker-voxceleb-resnet34-LM; do
+    [ -d "$f" ] || { echo "✗ 缺少模型目录: $f（先用 ModelScope 下载）"; exit 1; }
 done
 [ -d "test_spk/说话人识别测试/声纹库" ] || { echo "✗ 缺少声纹库目录"; exit 1; }
-[ -d "test_spk/说话人识别测试/拼接会议/音频" ] || { echo "✗ 缺少拼接会议音频目录"; exit 1; }
+# 会议音频与真值文本：eval_verification.py 按 .wav 开会、按 .txt 匹配真值，
+# 缺任一文件都会"成功"但产出空表，白耗算力
+[ -n "$(find "test_spk/说话人识别测试/拼接会议/音频" -maxdepth 1 -name '*.wav' -print -quit 2>/dev/null)" ] \
+    || { echo "✗ 未找到会议音频 .wav（test_spk/说话人识别测试/拼接会议/音频）"; exit 1; }
+[ -n "$(find "test_spk/说话人识别测试/拼接会议/文本" -maxdepth 1 -name '*.txt' -print -quit 2>/dev/null)" ] \
+    || { echo "✗ 未找到真值 .txt（test_spk/说话人识别测试/拼接会议/文本）"; exit 1; }
 echo "  ✓ 环境就绪"
 
 # ── 运行评估 ────────────────────────────────────────────────────────────────

@@ -109,8 +109,24 @@ def compute_eer(same_sims: np.ndarray, diff_sims: np.ndarray) -> dict:
         if best is None or abs(far - frr) < abs(best["far"] - best["frr"]):
             best = {"threshold": round(float(t), 3), "far": far, "frr": frr}
     # 额外候选：FAR<=1% 与 FAR<=5% 的最严阈值（生产更保守）
-    far1 = next((c for c in curve if c["far"] <= 0.01), curve[-1])
-    far5 = next((c for c in curve if c["far"] <= 0.05), curve[-1])
+    # 网格内可能没有阈值满足目标：此时不静默回退到最后一个网格点
+    # （该点同样不满足约束，会误导用户部署），而是显式置 None 并提示
+    far1 = next((c for c in curve if c["far"] <= 0.01), None)
+    far5 = next((c for c in curve if c["far"] <= 0.05), None)
+    if far1 is None:
+        print(
+            f"⚠ 提示: 网格内无阈值满足 FAR≤1%（最低 FAR="
+            f"{min(c['far'] for c in curve):.3f}），threshold_far1 置为 null",
+            flush=True,
+        )
+    if far5 is None:
+        print(
+            f"⚠ 提示: 网格内无阈值满足 FAR≤5%（最低 FAR="
+            f"{min(c['far'] for c in curve):.3f}），threshold_far5 置为 null",
+            flush=True,
+        )
+    far1 = far1 or {"threshold": None, "far": None, "frr": None}
+    far5 = far5 or {"threshold": None, "far": None, "frr": None}
     return {
         "eer": (best["far"] + best["frr"]) / 2,
         "eer_threshold": best["threshold"],
@@ -189,6 +205,12 @@ def main():
                         diff_sims.append(float(x @ y))
 
     same_sims, diff_sims = np.asarray(same_sims), np.asarray(diff_sims)
+    if len(same_sims) == 0 or len(diff_sims) == 0:
+        raise SystemExit(
+            "✗ 无法构建同人/异人对（same=%d, diff=%d）：请检查声纹库目录与真值数据，"
+            "至少需要 2 个已注册说话人且每人 >= 2 个可用段。"
+            % (len(same_sims), len(diff_sims))
+        )
     print(
         f"同人对 {len(same_sims)} 个 (均值 {same_sims.mean():.3f}) | "
         f"异人对 {len(diff_sims)} 个 (均值 {diff_sims.mean():.3f})",

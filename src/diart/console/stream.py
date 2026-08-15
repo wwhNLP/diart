@@ -174,22 +174,9 @@ def run():
         RTTMWriter(audio_source.uri, args.output / f"{audio_source.uri}.rttm")
     )
 
-    # 流式说话人确认事件打印（标签已重命名为真实人名）
-    printed_confirmations = set()
-
-    def print_confirmations(ann_wav):
-        ann = ann_wav[0]
-        info = getattr(ann, "speaker_verification", {})
-        for g_spk, v in info.items():
-            key = (g_spk, v["name"])
-            if key not in printed_confirmations:
-                printed_confirmations.add(key)
-                print(
-                    f"[声纹确认] speaker{g_spk} = {v['name']} "
-                    f"(相似度 {v['similarity']:.3f})"
-                )
-
-    inference.attach_hooks(print_confirmations)
+    # 流式说话人确认事件打印由 verification.StreamingSpeakerVerifier 统一负责
+    # （确认/撤销/识别变化均在 update() 内打印），此处不再挂 hook，避免同一
+    # 事件输出两遍、以及 dedup 集合导致撤销后重新确认不再打印的问题
     try:
         inference()
     except KeyboardInterrupt:

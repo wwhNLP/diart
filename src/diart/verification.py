@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,8 @@ class RegisteredSpeaker:
         self.embeddings = np.asarray(self.embeddings, dtype=np.float32)
         if self.embeddings.ndim == 1:
             self.embeddings = self.embeddings.reshape(1, -1)
-        assert self.embeddings.ndim == 2, "embeddings must be (n, dim) or (dim,)"
+        if self.embeddings.ndim != 2:
+            raise ValueError("embeddings must be (n, dim) or (dim,)")
 
     @property
     def embedding_dim(self) -> int:
@@ -108,7 +110,8 @@ class DirectoryVoiceprints(VoiceprintProvider):
         else:
             self.directories = [Path(d) for d in directory]
         for d in self.directories:
-            assert d.is_dir(), f"声纹库目录不存在: {d}"
+            if not d.is_dir():
+                raise ValueError(f"声纹库目录不存在: {d}")
         self.embedding_model = embedding_model
         self.device = device
         self.window = window
@@ -205,6 +208,9 @@ class DirectoryVoiceprints(VoiceprintProvider):
         import torch
 
         batch = audio.reshape(1, 1, -1)
+        # 模型可能与管道同设备（GPU），batch 必须与模型同设备，否则 device-mismatch
+        if self.device is not None:
+            batch = batch.to(self.device)
         with torch.no_grad():
             embedding = self.embedding_model(batch)
         if isinstance(embedding, torch.Tensor):
@@ -362,7 +368,8 @@ class StreamingSpeakerVerifier:
         mode: str = "verify",
         identify_min_similarity: float | None = None,
     ):
-        assert voiceprints, "声纹库为空，无法进行说话人确认"
+        if not voiceprints:
+            raise ValueError("声纹库为空，无法进行说话人确认")
         self.voiceprints = voiceprints
         self.threshold = threshold
         self.min_chunks = max(1, int(min_chunks))
@@ -391,6 +398,9 @@ class StreamingSpeakerVerifier:
         self._identifications: dict[int, VerifiedSpeaker] = {}
         # 标签跟踪：g -> 当前输出标签（"speakerX" 或 人名），用于撤销/改名回切
         self._label_state: dict[int, str] = {}
+        # 控制线程（WS 热重载/模式切换）与管线线程（每 chunk update）并发访问
+        # 同一状态，必须互斥，否则热重载期间可能撕裂状态/迭代中修改
+        self._lock = threading.Lock()
 
         self.set_mode(mode)
 
@@ -406,27 +416,31 @@ class StreamingSpeakerVerifier:
         """运行中切换模式（verify | identify），EMA 状态保留。"""
         if mode not in ("verify", "identify"):
             raise ValueError(f"未知模式: {mode}，可选 verify / identify")
-        if mode != self.mode:
-            self._label_state.clear()  # 标签语义变化，重置跟踪
-            self.mode = mode
+        with self._lock:
+            if mode != self.mode:
+                self._label_state.clear()  # 标签语义变化，重置跟踪
+                self.mode = mode
 
     # -- 状态视图 -------------------------------------------------------- #
     @property
     def confirmed(self) -> dict[int, VerifiedSpeaker]:
         """确认模式：已确认映射 {全局说话人下标 -> VerifiedSpeaker}。"""
-        return self._confirmed
+        with self._lock:
+            return dict(self._confirmed)
 
     @property
     def identifications(self) -> dict[int, VerifiedSpeaker]:
         """识别模式：每 chunk 的 Top-1 识别映射（含 top3 候选）。"""
-        return self._identifications
+        with self._lock:
+            return dict(self._identifications)
 
     @property
     def pending(self) -> dict[int, tuple[str, float, int]]:
         """候选状态视图：{全局说话人下标 -> (名字, 平滑相似度, 连续命中数)}。"""
-        return {
-            g: (st.name, st.ema, st.hits) for g, st in self._state.items()
-        }
+        with self._lock:
+            return {
+                g: (st.name, st.ema, st.hits) for g, st in self._state.items()
+            }
 
     # -- 每 chunk 更新 ---------------------------------------------------- #
     def update(
@@ -439,26 +453,66 @@ class StreamingSpeakerVerifier:
         低于门禁保持 speakerX。
         """
         if self._matrix.shape[0] == 0:
-            return self._confirmed if self.mode == "verify" else self._identifications
+            with self._lock:
+                return (
+                    dict(self._confirmed)
+                    if self.mode == "verify"
+                    else dict(self._identifications)
+                )
 
-        topk = 3
-        for g_spk in active_speakers:
-            if g_spk >= centers.shape[0]:
-                continue
-            vec = centers[g_spk]
-            norm = float(np.linalg.norm(vec))
-            if norm < 1e-10:
-                continue
-            query = vec / norm
-            similarities = query @ self._matrix.T
-            num = similarities.shape[0]
+        with self._lock:
+            topk = 3
+            for g_spk in active_speakers:
+                if g_spk >= centers.shape[0]:
+                    continue
+                vec = centers[g_spk]
+                norm = float(np.linalg.norm(vec))
+                if norm < 1e-10:
+                    continue
+                query = vec / norm
+                similarities = query @ self._matrix.T
+                num = similarities.shape[0]
 
-            if self.mode == "identify":
-                # Top-3 候选（识别模式）
-                k = min(topk, num)
-                top_idx = np.argpartition(similarities, -k)[-k:]
-                top_idx = top_idx[np.argsort(-similarities[top_idx])]
-                best_index = int(top_idx[0])
+                if self.mode == "identify":
+                    # Top-3 候选（识别模式）
+                    k = min(topk, num)
+                    top_idx = np.argpartition(similarities, -k)[-k:]
+                    top_idx = top_idx[np.argsort(-similarities[top_idx])]
+                    best_index = int(top_idx[0])
+                    best_sim = float(similarities[best_index])
+                    owner = self.voiceprints[self._owners[best_index]]
+
+                    state = self._state.get(g_spk)
+                    if state is None or state.name != owner.name:
+                        state = _PendingState(owner.name, owner.id, best_sim)
+                    else:
+                        state.ema = self.ema_alpha * best_sim + (1 - self.ema_alpha) * state.ema
+                    self._state[g_spk] = state
+                    prev = self._identifications.get(g_spk)
+                    self._identifications[g_spk] = VerifiedSpeaker(
+                        name=state.name,
+                        id=state.id,
+                        similarity=state.ema,
+                        top3=[
+                            (self.voiceprints[self._owners[int(i)]].name, float(similarities[i]))
+                            for i in top_idx[1:]
+                        ],
+                    )
+                    # 识别结果变化时打印（与 verify 模式的确认/撤销打印同源）
+                    new_label = (
+                        state.name
+                        if state.ema >= self.identify_gate
+                        else f"speaker{g_spk}"
+                    )
+                    if prev is None or prev.name != state.name:
+                        print(
+                            f"[声纹识别] speaker{g_spk} = {new_label} "
+                            f"(相似度 {state.ema:.3f})"
+                        )
+                    continue
+
+                # ---- verify 模式（原逻辑） ----
+                best_index = int(np.argmax(similarities))
                 best_sim = float(similarities[best_index])
                 owner = self.voiceprints[self._owners[best_index]]
 
@@ -468,62 +522,40 @@ class StreamingSpeakerVerifier:
                 else:
                     state.ema = self.ema_alpha * best_sim + (1 - self.ema_alpha) * state.ema
                 self._state[g_spk] = state
-                self._identifications[g_spk] = VerifiedSpeaker(
-                    name=state.name,
-                    id=state.id,
-                    similarity=state.ema,
-                    top3=[
-                        (self.voiceprints[self._owners[int(i)]].name, float(similarities[i]))
-                        for i in top_idx[1:]
-                    ],
-                )
-                continue
 
-            # ---- verify 模式（原逻辑） ----
-            best_index = int(np.argmax(similarities))
-            best_sim = float(similarities[best_index])
-            owner = self.voiceprints[self._owners[best_index]]
-
-            state = self._state.get(g_spk)
-            if state is None or state.name != owner.name:
-                state = _PendingState(owner.name, owner.id, best_sim)
-            else:
-                state.ema = self.ema_alpha * best_sim + (1 - self.ema_alpha) * state.ema
-            self._state[g_spk] = state
-
-            if g_spk in self._confirmed:
-                # 已确认：持续监控，相似度持续低于阈值则撤销确认，恢复原标签
-                if state.ema < self.threshold:
-                    state.hits += 1
-                    if state.hits >= self.unconfirm_min_chunks:
-                        del self._confirmed[g_spk]
+                if g_spk in self._confirmed:
+                    # 已确认：持续监控，相似度持续低于阈值则撤销确认，恢复原标签
+                    if state.ema < self.threshold:
+                        state.hits += 1
+                        if state.hits >= self.unconfirm_min_chunks:
+                            del self._confirmed[g_spk]
+                            state.hits = 0
+                            print(
+                                f"[声纹确认] speaker{g_spk} 撤销确认 "
+                                f"(相似度 {state.ema:.3f} < 阈值 {self.threshold})，"
+                                "恢复原标签"
+                            )
+                    else:
                         state.hits = 0
-                        print(
-                            f"[声纹确认] speaker{g_spk} 撤销确认 "
-                            f"(相似度 {state.ema:.3f} < 阈值 {self.threshold})，"
-                            "恢复原标签"
-                        )
                 else:
-                    state.hits = 0
-            else:
-                # 未确认：连续达标才确认
-                state.hits = state.hits + 1 if state.ema >= self.threshold else 0
-                if state.hits >= self.min_chunks:
-                    self._confirmed[g_spk] = VerifiedSpeaker(
-                        name=state.name, id=state.id, similarity=state.ema
-                    )
-                    print(
-                        f"[声纹确认] speaker{g_spk} = {state.name} "
-                        f"(相似度 {state.ema:.3f})"
-                    )
+                    # 未确认：连续达标才确认
+                    state.hits = state.hits + 1 if state.ema >= self.threshold else 0
+                    if state.hits >= self.min_chunks:
+                        self._confirmed[g_spk] = VerifiedSpeaker(
+                            name=state.name, id=state.id, similarity=state.ema
+                        )
+                        print(
+                            f"[声纹确认] speaker{g_spk} = {state.name} "
+                            f"(相似度 {state.ema:.3f})"
+                        )
 
-        # 已确认说话人的相似度随质心更新
-        for g_spk, verified in self._confirmed.items():
-            state = self._state.get(g_spk)
-            if state is not None:
-                verified.similarity = state.ema
+            # 已确认说话人的相似度随质心更新
+            for g_spk, verified in self._confirmed.items():
+                state = self._state.get(g_spk)
+                if state is not None:
+                    verified.similarity = state.ema
 
-        return self._confirmed
+            return dict(self._confirmed)
 
     # -- 标签改名 --------------------------------------------------------- #
     def _build_rename_mapping(self) -> dict:
@@ -562,7 +594,8 @@ class StreamingSpeakerVerifier:
 
     def rename_annotation(self, annotation) -> "Annotation":
         """按当前模式重命名标签（原地修改，含撤销恢复/改名回切）。"""
-        mapping = self._build_rename_mapping()
+        with self._lock:
+            mapping = self._build_rename_mapping()
         if mapping:
             annotation.rename_labels(mapping=mapping, copy=False)
         return annotation
@@ -572,37 +605,40 @@ class StreamingSpeakerVerifier:
 
         已确认/候选说话人若名字仍在新库中则保留（声纹行可能已扩充），
         否则失效：确认的自动恢复 speakerX，候选的直接清除。
+        允许空库：清空矩阵后匹配自动失效（update 对空矩阵直接返回空映射）。
         """
-        assert voiceprints, "声纹库为空，无法进行说话人确认"
-        self.voiceprints = voiceprints
-        rows, owners = [], []
-        for idx, spk in enumerate(voiceprints):
-            for embedding in spk.embeddings:
-                rows.append(embedding)
-                owners.append(idx)
-        self._matrix = np.vstack(rows) if rows else np.empty((0, 0), dtype=np.float32)
-        self._owners = np.asarray(owners, dtype=np.int64)
+        with self._lock:
+            self.voiceprints = voiceprints
+            rows, owners = [], []
+            for idx, spk in enumerate(voiceprints):
+                for embedding in spk.embeddings:
+                    rows.append(embedding)
+                    owners.append(idx)
+            self._matrix = (
+                np.vstack(rows) if rows else np.empty((0, 0), dtype=np.float32)
+            )
+            self._owners = np.asarray(owners, dtype=np.int64)
 
-        valid_names = {spk.name for spk in voiceprints}
-        # 失效的已确认说话人：标签恢复 speakerX
-        for g_spk in list(self._confirmed):
-            if self._confirmed[g_spk].name not in valid_names:
-                old = self._label_state.get(g_spk)
-                if old is not None and old != f"speaker{g_spk}":
-                    print(
-                        f"[声纹重载] speaker{g_spk} ({old}) 已从声纹库移除，恢复原标签",
-                        flush=True,
-                    )
-                self._label_state[g_spk] = f"speaker{g_spk}"
-                del self._confirmed[g_spk]
-        # 失效的候选状态清除
-        for g_spk in list(self._state):
-            if self._state[g_spk].name not in valid_names:
-                del self._state[g_spk]
-        # 失效的识别结果清除
-        for g_spk in list(self._identifications):
-            if self._identifications[g_spk].name not in valid_names:
-                del self._identifications[g_spk]
+            valid_names = {spk.name for spk in voiceprints}
+            # 失效的已确认说话人：标签恢复 speakerX
+            for g_spk in list(self._confirmed):
+                if self._confirmed[g_spk].name not in valid_names:
+                    old = self._label_state.get(g_spk)
+                    if old is not None and old != f"speaker{g_spk}":
+                        print(
+                            f"[声纹重载] speaker{g_spk} ({old}) 已从声纹库移除，恢复原标签",
+                            flush=True,
+                        )
+                    self._label_state[g_spk] = f"speaker{g_spk}"
+                    del self._confirmed[g_spk]
+            # 失效的候选状态清除
+            for g_spk in list(self._state):
+                if self._state[g_spk].name not in valid_names:
+                    del self._state[g_spk]
+            # 失效的识别结果清除
+            for g_spk in list(self._identifications):
+                if self._identifications[g_spk].name not in valid_names:
+                    del self._identifications[g_spk]
         print(
             f"[声纹重载] 声纹库已更新: {len(voiceprints)} 个说话人 "
             f"(确认状态保留 {len(self._confirmed)} 个)",
@@ -611,7 +647,8 @@ class StreamingSpeakerVerifier:
 
     def reset(self):
         """重置状态（随管道 reset 调用）。"""
-        self._state.clear()
-        self._confirmed.clear()
-        self._identifications.clear()
-        self._label_state.clear()
+        with self._lock:
+            self._state.clear()
+            self._confirmed.clear()
+            self._identifications.clear()
+            self._label_state.clear()

@@ -11,12 +11,23 @@ from torch import nn
 
 # 兼容性 shim：部分环境（torchaudio 2.9+ 移除 list_audio_backends，或
 # C 扩展加载失败时）speechbrain 导入会因缺少该属性而崩溃。
+# C 扩展加载失败通常抛 OSError，因此 except 必须同时覆盖 ImportError。
 try:
     import torchaudio
 
     if not hasattr(torchaudio, "list_audio_backends"):
-        torchaudio.list_audio_backends = lambda: []
-except ImportError:
+        def _list_audio_backends():
+            """兜底探测真实可用的后端，避免空列表误导调用方。"""
+            import importlib.util
+
+            return [
+                name
+                for name in ("soundfile", "sox", "ffmpeg")
+                if importlib.util.find_spec(name) is not None
+            ]
+
+        torchaudio.list_audio_backends = _list_audio_backends
+except (ImportError, OSError):
     pass
 
 try:

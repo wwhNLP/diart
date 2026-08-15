@@ -115,7 +115,12 @@ class Session:
     def stop(self) -> None:
         """请求结束会话（可重入）。"""
         self._stop_evt.set()
-        self._queue.put(None)  # 唤醒发送循环
+        # 唤醒发送循环：必须用 put_nowait，阻塞 put 在队列满（上游离线时
+        # 线程不消费队列）会永久卡住，进而挂死整个事件循环
+        try:
+            self._queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     def join(self, timeout: float = 8.0) -> None:
         self._thread.join(timeout=timeout)
@@ -161,7 +166,11 @@ class Session:
     def _send_control_now(self, msg: dict) -> None:
         try:
             self._ws.send(json.dumps(msg, ensure_ascii=False))
-            self._write_log_line(f"# 控制消息 -> 上游: {json.dumps(msg, ensure_ascii=False)}")
+            # 日志写入需持锁：与 _handle_message / _finalize 并发访问同一文件
+            with self._lock:
+                self._write_log_line(
+                    f"# 控制消息 -> 上游: {json.dumps(msg, ensure_ascii=False)}"
+                )
         except Exception as exc:
             LOG.warning("控制消息发送失败: %r", exc)
 
@@ -388,7 +397,13 @@ class WebConsole:
                     except json.JSONDecodeError:
                         await self._send(ws, {"type": "error", "msg": "非法消息"})
                         continue
-                    await self._handle_browser_msg(ws, data)
+                    try:
+                        await self._handle_browser_msg(ws, data)
+                    except Exception:
+                        LOG.exception("处理浏览器消息失败")
+                        await self._send(
+                            ws, {"type": "error", "msg": "服务器内部错误"}
+                        )
                 elif msg.type in (WSMsgType.CLOSE, WSMsgType.ERROR):
                     break  # 浏览器断开，必须退出循环才能执行清理
                 # BINARY/PING/PONG 忽略
@@ -396,15 +411,27 @@ class WebConsole:
             if ws in self._browsers:
                 self._browsers.remove(ws)
             # 唯一客户端断开时，结束进行中的会话，避免上游连接悬挂
-            await self._stop_session()
+            # （多客户端共享会话时，任一客户端断开不得中断他人）
+            if not self._browsers:
+                await self._stop_session()
             LOG.info("浏览器已断开 (%d)", len(self._browsers))
         return ws
 
     async def _handle_browser_msg(self, ws: web.WebSocketResponse, data: dict) -> None:
+        # 浏览器消息不可信：先校验结构，坏消息只报错、不得中断会话
+        if not isinstance(data, dict):
+            await self._send(ws, {"type": "error", "msg": "非法消息"})
+            return
         mtype = data.get("type")
         if mtype == "config":
-            self.server_host = str(data.get("server_host") or self.server_host)
-            self.server_port = int(data.get("server_port") or self.server_port)
+            try:
+                self.server_host = str(data.get("server_host") or self.server_host)
+                self.server_port = int(data.get("server_port") or self.server_port)
+            except (TypeError, ValueError):
+                await self._send(
+                    ws, {"type": "error", "msg": "server_port 必须为数字"}
+                )
+                return
             await self._send(
                 ws,
                 {
@@ -478,7 +505,8 @@ class WebConsole:
             sess, self._session = self._session, None
             if sess is not None:
                 sess.stop()
-                sess.join(timeout=8.0)
+                # join 是阻塞调用，放线程池执行，避免卡住事件循环
+                await asyncio.to_thread(sess.join, 8.0)
                 self._update_index()
                 LOG.info("会话 %s 已停止", sess.sid)
 
@@ -672,8 +700,33 @@ class WebConsole:
                 return web.json_response({"ok": False, "msg": "音频文件过小，请检查"})
 
             # 保存到 <temp_dir>/<姓名>/<时间戳>.<ext>
+            # 防路径穿越：姓名必须是纯目录名，禁止路径分隔符 / \\、.. 、
+            # 隐藏文件前缀或控制字符（与 delete 接口的 resolve 校验等价）
+            if (
+                name in (".", "..")
+                or "/" in name
+                or "\\" in name
+                or name.startswith(".")
+                or any(ord(ch) < 32 for ch in name)
+            ):
+                return web.json_response(
+                    {"ok": False, "msg": "说话人姓名非法（不能包含路径分隔符或 ..）"}
+                )
             spk_dir = self.temp_vp_dir / name
-            spk_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                spk_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                LOG.exception("创建声纹目录失败: %s", spk_dir)
+                return web.json_response(
+                    {"ok": False, "msg": f"创建目录失败: {exc}"}
+                )
+            # 双保险：确认最终目录仍在临时库根目录下
+            if not spk_dir.resolve().is_relative_to(
+                self.temp_vp_dir.resolve()
+            ):
+                return web.json_response(
+                    {"ok": False, "msg": "说话人姓名非法（路径越界）"}
+                )
             filename = time.strftime("%Y%m%d_%H%M%S") + audio_ext
             path = spk_dir / filename
             path.write_bytes(audio_data)

@@ -535,8 +535,10 @@ function connectRelay(){
   };
 }
 function sendRelay(obj){
-  if (S.relay && S.relay.readyState === 1) S.relay.send(JSON.stringify(obj));
-  else toast(t("relayDown"), "error");
+  if (S.relay && S.relay.readyState === 1){ S.relay.send(JSON.stringify(obj)); return; }
+  // 中继离线时每 0.5s 一个音频块，若每次都弹 toast 会刷屏；复用
+  // relayDownNotified 标记，每次离线只提示一次（重连成功时复位）
+  if (!relayDownNotified){ relayDownNotified = true; toast(t("relayDown"), "error"); }
 }
 function setRelayBadge(ok){
   const b = $("badge-relay");
@@ -632,6 +634,20 @@ function handleRttmMsg(text, wallT){
     S.segments.push(seg);
   }
   S.lastSegEnd = Math.max(S.lastSegEnd, ...newSegs.map(s => s.start + s.dur));
+  // 剪枝：只保留最近 PRUNE_SEC 秒的线段（含 DOM），防止长会话内存/DOM 无界增长。
+  // 历史回放（S.replayId）显式查看完整会话，不做剪枝
+  if (!S.replayId){
+    const PRUNE_SEC = 1800;
+    const cutoff = S.lastSegEnd - PRUNE_SEC;
+    if (cutoff > 0){
+      const keep = [];
+      for (const s of S.segments){
+        if (s.start + s.dur < cutoff){ if (s.el) s.el.remove(); continue; }
+        keep.push(s);
+      }
+      if (keep.length !== S.segments.length) S.segments = keep;
+    }
+  }
   // 渲染合并到 rAF：同一帧内多次消息只渲染一次，避免每次消息都重建 DOM
   scheduleRender();
 }
@@ -666,7 +682,15 @@ function laneOf(spk){
   if (!lane){
     lane = document.createElement("div");
     lane.className = "lane"; lane.dataset.spk = spk;
-    lane.innerHTML = `<div class="lane-label" style="color:${speakerColor(spk)}">${spkShort(spk)}</div><div class="lane-track"></div>`;
+    // 说话人标签可能是用户上传的声纹名（verify/identify 模式），必须用
+    // textContent 注入，否则 innerHTML 会执行其中的 HTML/脚本（存储型 XSS）
+    const label = document.createElement("div");
+    label.className = "lane-label";
+    label.style.color = speakerColor(spk);
+    label.textContent = spkShort(spk);
+    const track = document.createElement("div");
+    track.className = "lane-track";
+    lane.append(label, track);
     tlLanes.appendChild(lane);
     laneMap.set(spk, lane);
   }
@@ -687,7 +711,7 @@ function createSegEl(seg){
 function renderRuler(){
   tlRuler.innerHTML = "";
   const total = tlWidth();
-  const step = niceStep(total / S.pps);
+  const step = niceStep(90 / S.pps);
   for (let x = 0; x <= total / S.pps + step; x += step){
     const d = document.createElement("div");
     d.className = "tick";
@@ -696,8 +720,9 @@ function renderRuler(){
     tlRuler.appendChild(d);
   }
 }
-function niceStep(secs){
-  const target = 90 / S.pps; // 目标刻度间距(像素) → 秒
+function niceStep(targetSecs){
+  // targetSecs: 目标刻度间距（秒）≈ 90px；取 >= target 的最小标准档
+  const target = targetSecs;
   for (const s of [1,2,5,10,15,30,60,120,300,600]) if (s >= target) return s;
   return 1800;
 }
@@ -722,7 +747,10 @@ function renderLegendIncremental(){
     if (legendChips.has(spk)) continue;  // 已存在，不动
     const c = document.createElement("span");
     c.className = "legend-chip";
-    c.innerHTML = `<i style="background:${speakerColor(spk)}"></i>${spkShort(spk)}`;
+    // textContent 注入：说话人标签可为用户上传的声纹名，避免存储型 XSS
+    const i = document.createElement("i");
+    i.style.background = speakerColor(spk);
+    c.append(i, document.createTextNode(spkShort(spk)));
     box.appendChild(c);
     legendChips.set(spk, c);
   }
@@ -929,6 +957,9 @@ async function startMic(){
   pendingMode = "mic";
   const Ctx = window.AudioContext || window.webkitAudioContext;
   S.micCtx = new Ctx({ sampleRate: 16000 });
+  // getUserMedia 之后创建 AudioContext 可能因失去用户手势而处于 suspended，
+  // 此时 onaudioprocess 不会触发、会话静默无声音；显式 resume
+  if (S.micCtx.state === "suspended") S.micCtx.resume();
   S.micRaw = new Float32Array(Math.round(S.micCtx.sampleRate * 0.5));
   S.micRawLen = 0;
   S.micSentTotal = 0;
@@ -1072,7 +1103,12 @@ async function loadFile(file){
   } catch(err){ toast(t("micStartErr") + ": " + err.message, "error"); return; }
   if (decoded.duration < 5.5) toast(t("fileTooShort"), "warn");
   pendingMode = "file";
-  S.fileBuf = await resampleTo16k(decoded);
+  try {
+    S.fileBuf = await resampleTo16k(decoded);
+  } catch(err){
+    toast(t("micStartErr") + ": " + err.message, "error");
+    return;
+  }
   S.fileTotal = S.fileBuf.length;
   S.filePos = 0; S.filePaused = false; S.fileOn = true;
   S.fileSpeed = parseFloat($("speed").value) || 1;
@@ -1163,7 +1199,14 @@ function stopSession(){
 function appendRaw(lines, wallT){
   const box = $("raw-log");
   const d = document.createElement("div");
-  d.innerHTML = `<span class="ts">[${new Date(wallT * 1000).toLocaleTimeString()}]</span> ` + lines.map(l => l.trim()).join(" ");
+  // textContent 注入：RTTM 行的说话人标签可为用户上传的声纹名，
+  // 用 innerHTML 会执行其中的 HTML/脚本（存储型 XSS）
+  const ts = document.createElement("span");
+  ts.className = "ts";
+  ts.textContent = `[${new Date(wallT * 1000).toLocaleTimeString()}]`;
+  const body = document.createElement("span");
+  body.textContent = lines.map(l => l.trim()).join(" ");
+  d.append(ts, " ", body);
   box.appendChild(d);
   const all = box.querySelectorAll("div");
   if (all.length > 800) all[0].remove();
@@ -1229,7 +1272,13 @@ async function replayHistory(sid){
   $("replay-id").textContent = sid;
   const msgs = j.messages || [];
   if (!msgs.length){ toast(t("nothingToExport"), "warn"); return; }
-  for (const m of msgs) handleRttmMsg(m.text, m.t);
+  // 分批回放：小时级会话可达数千条消息，同步灌入会冻结主线程；
+  // 每批让出事件循环，渲染保持增量
+  const BATCH = 50;
+  for (let i = 0; i < msgs.length; i += BATCH){
+    for (const m of msgs.slice(i, i + BATCH)) handleRttmMsg(m.text, m.t);
+    await new Promise(r => setTimeout(r, 0));
+  }
   toast(t("replayOk"), "ok");
   autoScroll();
 }
@@ -1381,6 +1430,7 @@ async function startVpRecord(){
   } catch(err){ toast(t("micError") + ": " + err.message, "error"); return; }
   const Ctx = window.AudioContext || window.webkitAudioContext;
   const ctx = new Ctx({ sampleRate: 16000 });
+  if (ctx.state === "suspended") ctx.resume();  // 同上：避免录制静默
   vpRec = { ctx, stream, chunks: [], sr: ctx.sampleRate, startT: Date.now(), timer: null };
   try {
     const src = ctx.createMediaStreamSource(stream);

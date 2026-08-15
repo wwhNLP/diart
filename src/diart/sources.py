@@ -252,6 +252,11 @@ class WebSocketAudioSource(AudioSource):
         # 其余一律按音频 base64 解码（双条件判定，避免音频串被误判）
         ctrl = self._try_parse_control(message)
         if ctrl is not None:
+            if ctrl.get("type") == "unknown":
+                # 合法 JSON dict 但非已知控制类型：不能按 base64 音频解码
+                # （JSON 字符不在 base64 字母表，会抛 binascii.Error），安全忽略
+                print(f"[diart] 忽略未知控制消息: {message}", flush=True)
+                return
             if self.on_control is not None:
                 self.on_control(ctrl)
             else:
@@ -266,10 +271,13 @@ class WebSocketAudioSource(AudioSource):
 
     @staticmethod
     def _try_parse_control(message: AnyStr) -> Optional[Dict[Text, Any]]:
-        """尝试把消息解析为控制消息；非控制消息返回 None。
+        """尝试把消息解析为控制消息；非 JSON 文本返回 None（按音频处理）。
 
-        双条件判定：必须是 JSON dict、type 为已知控制类型、且字段合法，
-        任一不满足即视为音频（base64 串极少能被解析为这种 dict）。
+        双条件判定：必须是 JSON、type 为已知控制类型、且字段合法，
+        任一不满足即视为音频（base64 串极少能被解析为 JSON）。
+        注意：能成功解析为 JSON 的都不是 base64 音频（JSON 字符不在
+        base64 字母表），未知类型返回 {"type": "unknown"} 哨兵，由
+        调用方安全忽略，而不是落到 base64 解码抛 binascii.Error。
         """
         if not isinstance(message, str):
             return None
@@ -278,7 +286,7 @@ class WebSocketAudioSource(AudioSource):
         except (json.JSONDecodeError, ValueError):
             return None
         if not isinstance(data, dict):
-            return None
+            return {"type": "unknown"}
         mtype = data.get("type")
         if mtype == "mode":
             mode = data.get("mode")
@@ -286,7 +294,8 @@ class WebSocketAudioSource(AudioSource):
                 return {"type": "mode", "mode": mode}
         if mtype == "reload_voiceprints":
             return {"type": "reload_voiceprints"}
-        return None
+        # 已是 JSON dict 但非已知控制类型：安全忽略（同上）
+        return {"type": "unknown"}
 
     def read(self):
         """Starts running the websocket server and listening for audio chunks"""
