@@ -28,9 +28,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--audio-dir", default=AUDIO_DIR, type=str, help="音频目录（*.wav）")
     parser.add_argument("--out", default="docs/results/rttm_eer05", type=str,
-                        help="RTTM 输出目录")
+                        help="RTTM 输出目录（默认: docs/results/rttm_eer05）")
     parser.add_argument("--voiceprint-dir", default=VP_DIR, type=str, help="声纹库目录")
     parser.add_argument("--threshold", default=0.5, type=float, help="确认阈值（EER 校准值）")
+    parser.add_argument("--verify-mode", default="verify", type=str,
+                        choices=["verify", "identify"],
+                        help="verify=确认（默认）；identify=识别（open-set，即时 Top-1，低于门禁保持 speakerX）")
     parser.add_argument("--delta-new", default=0.8, type=float, help="聚类新说话人距离阈值")
     parser.add_argument("--min-chunks", default=3, type=int)
     parser.add_argument("--meeting", default=None, type=str, help="只处理包含该关键字的音频")
@@ -46,6 +49,7 @@ def main():
         voiceprint_dir=args.voiceprint_dir,
         verify_threshold=args.threshold,
         verify_min_chunks=args.min_chunks,
+        verify_mode=args.verify_mode,
     )
 
     audio_files = sorted(glob.glob(os.path.join(args.audio_dir, "*.wav")))

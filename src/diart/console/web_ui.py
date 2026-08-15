@@ -26,6 +26,7 @@ import asyncio
 import json
 import logging
 import queue
+import shutil
 import threading
 import time
 import uuid
@@ -35,7 +36,11 @@ from pathlib import Path
 from typing import Any
 
 from aiohttp import WSMsgType, web
-from websocket import WebSocketConnectionClosedException, create_connection
+from websocket import (
+    WebSocketConnectionClosedException,
+    WebSocketTimeoutException,
+    create_connection,
+)
 
 LOG = logging.getLogger("diart.web")
 
@@ -84,6 +89,8 @@ class Session:
         self.messages: list[dict[str, Any]] = []  # [{t, text}] 供历史回放
 
         self._state = "idle"
+        self._ws = None  # 当前上游连接（send_control 直接发送）
+        self._pending_controls: list[dict] = []  # 未连接时暂存的控制消息
         # 有界缓冲：上游短暂离线时音频不丢弃（最多 60 块 ≈ 30s，旧块优先淘汰）
         self._queue: queue.Queue[str | None] = queue.Queue(maxsize=60)
         self._stop_evt = threading.Event()
@@ -126,6 +133,7 @@ class Session:
         """浏览器音频块（base64 text）→ 上游。离线时暂存，重连后按序补发。"""
         if self._stop_evt.is_set():
             return
+        self.num_audio_in = getattr(self, 'num_audio_in', 0) + 1
         while self._queue.full():
             try:
                 self._queue.get_nowait()
@@ -135,6 +143,34 @@ class Session:
             self._queue.put_nowait(base64_data)
         except queue.Full:
             pass
+
+    def send_control(self, msg: dict) -> None:
+        """控制消息（如模式切换/声纹重载）→ 上游，立即发送、不经过音频队列。
+        上游未连接时暂存，连接建立后按序补发。
+        依赖 websocket-client 的 enable_multithread 支持并发 send。"""
+        if self._stop_evt.is_set():
+            return
+        if self._state != "online" or self._ws is None:
+            with self._lock:
+                if len(self._pending_controls) < 10:
+                    self._pending_controls.append(msg)
+            LOG.info("上游未连接，控制消息暂存: %s", msg)
+            return
+        self._send_control_now(msg)
+
+    def _send_control_now(self, msg: dict) -> None:
+        try:
+            self._ws.send(json.dumps(msg, ensure_ascii=False))
+            self._write_log_line(f"# 控制消息 -> 上游: {json.dumps(msg, ensure_ascii=False)}")
+        except Exception as exc:
+            LOG.warning("控制消息发送失败: %r", exc)
+
+    def _flush_pending_controls(self) -> None:
+        with self._lock:
+            pending, self._pending_controls = self._pending_controls, []
+        for msg in pending:
+            self._send_control_now(msg)
+            LOG.info("补发暂存控制消息: %s", msg)
 
     # -- 线程主体 --------------------------------------------------------- #
     def _run(self) -> None:
@@ -160,6 +196,8 @@ class Session:
 
             self._state = "online"
             self.emit({"type": "status", "state": "online", "session_id": self.sid})
+            self._ws = ws
+            self._flush_pending_controls()
             recv_t = threading.Thread(target=self._recv_loop, args=(ws,), daemon=True)
             recv_t.start()
             try:
@@ -182,6 +220,7 @@ class Session:
                     ws.close()
                 except Exception as exc:
                     LOG.debug("close 异常: %r", exc)
+                self._ws = None
                 recv_t.join(timeout=2.0)
                 LOG.debug("recv 线程已退出 (alive=%s)", recv_t.is_alive())
                 self._state = "offline"
@@ -196,6 +235,10 @@ class Session:
         while not self._stop_evt.is_set():
             try:
                 msg = ws.recv()
+            except WebSocketTimeoutException:
+                # 空闲超时（上游静音期无下行消息）：属正常现象，继续等待；
+                # 不能 break——否则接收线程退出后 RTTM 永远不再刷新
+                continue
             except WebSocketConnectionClosedException as exc:
                 LOG.debug("recv: 连接关闭 %r", exc)
                 break
@@ -256,7 +299,10 @@ class Session:
         except OSError:
             LOG.exception("写入会话 JSON 失败")
         self.emit({"type": "status", "state": "stopped", "session_id": self.sid})
-        LOG.info("会话 %s 结束：%d 条 RTTM 行", self.sid, self.num_lines)
+        LOG.info(
+            "会话 %s 结束：%d 条 RTTM 行，收到音频块 %d 个",
+            self.sid, self.num_lines, getattr(self, 'num_audio_in', 0),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +322,17 @@ class WebConsole:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._server_online: bool | None = None
         self._index_html: str | None = None
+        self.verify_mode: str = args.verify_mode  # "verify" | "identify"
+        self._pending_vp_reload = False  # 无会话时上传声纹的待重载标记
+        # 临时声纹库（上传添加声纹；需与 serve 的 --temp-voiceprint-dir 一致）
+        self.temp_vp_dir: Path | None = (
+            Path(args.temp_voiceprint_dir).expanduser().resolve()
+            if args.temp_voiceprint_dir
+            else None
+        )
+        if self.temp_vp_dir is not None:
+            self.temp_vp_dir.mkdir(parents=True, exist_ok=True)
+            LOG.info("临时声纹库目录: %s", self.temp_vp_dir)
 
     # -- 浏览器消息推送 --------------------------------------------------- #
     @staticmethod
@@ -320,6 +377,7 @@ class WebConsole:
                 "server_host": self.server_host,
                 "server_port": self.server_port,
                 "server_online": self._server_online,
+                "verify_mode": self.verify_mode,
             },
         )
         try:
@@ -354,8 +412,11 @@ class WebConsole:
                     "server_host": self.server_host,
                     "server_port": self.server_port,
                     "server_online": self._server_online,
+                    "verify_mode": self.verify_mode,
                 },
             )
+        elif mtype == "mode":
+            await self._switch_mode(ws, data)
         elif mtype == "start":
             await self._start_session(ws, data)
         elif mtype == "audio":
@@ -367,6 +428,27 @@ class WebConsole:
             await self._stop_session()
         else:
             await self._send(ws, {"type": "error", "msg": f"未知消息: {mtype}"})
+
+    async def _switch_mode(self, ws: web.WebSocketResponse, data: dict) -> None:
+        """浏览器请求切换说话人模式（确认 <-> 识别），转发给上游 serve。"""
+        mode = data.get("mode")
+        if mode not in ("verify", "identify"):
+            await self._send(ws, {"type": "error", "msg": f"未知模式: {mode}"})
+            return
+        if mode == self.verify_mode:
+            await self._send(ws, {"type": "mode", "mode": mode, "applied": True})
+            return
+        if self._session is not None and self._session.active:
+            self._session.send_control({"type": "mode", "mode": mode})
+            self.verify_mode = mode
+            await self._send(ws, {"type": "mode", "mode": mode, "applied": True})
+            LOG.info("模式切换请求 -> %s", mode)
+        else:
+            # 无会话：直接改本地状态（serve 侧以启动参数为准，下次会话前如需
+            # 生效可先启动会话再切换）
+            self.verify_mode = mode
+            await self._send(ws, {"type": "mode", "mode": mode, "applied": True})
+            LOG.info("模式已保存（无会话）: %s", mode)
 
     async def _start_session(self, ws: web.WebSocketResponse, data: dict) -> None:
         async with self._session_lock:
@@ -384,6 +466,11 @@ class WebConsole:
                 sid, mode, self.server_host, self.server_port, self.log_dir, self.emit
             )
             self._session.start()
+            # 会话建立：若有待重载的临时声纹，补发 reload 控制消息
+            if self._pending_vp_reload:
+                self._session.send_control({"type": "reload_voiceprints"})
+                self._pending_vp_reload = False
+                LOG.info("会话开始，补发临时声纹热重载")
             LOG.info("会话 %s 开始 (mode=%s)", sid, mode)
 
     async def _stop_session(self) -> None:
@@ -492,12 +579,127 @@ class WebConsole:
             self._update_index()
             return web.json_response({"deleted": deleted})
 
+        # ---- 临时声纹库（添加声纹 / 列表） ----
+        VP_EXTS = {".wav", ".m4a", ".mp3", ".flac", ".amr"}
+        VP_MAX_BYTES = 50 * 1024 * 1024  # 50MB
+
+        async def api_voiceprints_list(_: web.Request) -> web.Response:
+            """GET /api/voiceprints：列出临时声纹库的说话人与音频。"""
+            if self.temp_vp_dir is None:
+                return web.json_response({"enabled": False, "speakers": []})
+            speakers = []
+            for folder in sorted(self.temp_vp_dir.iterdir()):
+                if not folder.is_dir():
+                    continue
+                files = sorted(
+                    f.name for f in folder.iterdir()
+                    if f.is_file() and f.suffix.lower() in VP_EXTS
+                )
+                speakers.append({"name": folder.name, "files": files})
+            return web.json_response(
+                {"enabled": True, "dir": str(self.temp_vp_dir), "speakers": speakers}
+            )
+
+        async def api_voiceprints_delete(request: web.Request) -> web.Response:
+            """DELETE /api/voiceprints/{name}：删除临时库中某说话人的全部声纹。"""
+            if self.temp_vp_dir is None:
+                raise web.HTTPBadRequest(
+                    text=json.dumps(
+                        {"ok": False, "msg": "服务端未配置 --temp-voiceprint-dir"},
+                        ensure_ascii=False,
+                    ),
+                    content_type="application/json",
+                )
+            name = request.match_info["name"]
+            # 防路径穿越：只允许删除临时库根目录下的直接子目录
+            spk_dir = (self.temp_vp_dir / name).resolve()
+            if not spk_dir.is_relative_to(self.temp_vp_dir.resolve()) or \
+               spk_dir == self.temp_vp_dir.resolve():
+                return web.json_response({"ok": False, "msg": "非法路径"})
+            if not spk_dir.is_dir():
+                return web.json_response({"ok": False, "msg": f"说话人不存在: {name}"})
+            deleted = [f.name for f in spk_dir.iterdir() if f.is_file()]
+            shutil.rmtree(spk_dir)
+            LOG.info("临时声纹已删除: %s (%d 个文件)", spk_dir, len(deleted))
+            # 通知 serve 热重载
+            reloaded = False
+            if self._session is not None and self._session.active:
+                self._session.send_control({"type": "reload_voiceprints"})
+                reloaded = True
+            else:
+                self._pending_vp_reload = True
+                LOG.info("无会话，标记待重载")
+            return web.json_response(
+                {"ok": True, "speaker": name, "deleted": deleted, "reloaded": reloaded}
+            )
+
+        async def api_voiceprints_add(request: web.Request) -> web.Response:
+            """POST /api/voiceprints：上传声纹音频（multipart: name + audio）。"""
+            if self.temp_vp_dir is None:
+                raise web.HTTPBadRequest(
+                    text=json.dumps(
+                        {"ok": False, "msg": "服务端未配置 --temp-voiceprint-dir"},
+                        ensure_ascii=False,
+                    ),
+                    content_type="application/json",
+                )
+            try:
+                reader = await request.multipart()
+                name, audio_data, audio_ext = None, None, None
+                while True:
+                    part = await reader.next()
+                    if part is None:
+                        break
+                    if part.name == "name":
+                        name = (await part.read()).decode("utf-8", "ignore").strip()
+                    elif part.name == "audio":
+                        ext = Path(part.filename or "").suffix.lower()
+                        if ext in VP_EXTS:
+                            audio_ext = ext
+                            audio_data = await part.read()
+            except Exception as exc:
+                LOG.exception("解析上传失败")
+                return web.json_response({"ok": False, "msg": f"上传解析失败: {exc}"})
+            if not name:
+                return web.json_response({"ok": False, "msg": "说话人姓名不能为空"})
+            if audio_data is None or audio_ext is None:
+                return web.json_response(
+                    {"ok": False, "msg": "请选择音频文件 (wav/m4a/mp3/flac/amr)"}
+                )
+            if len(audio_data) > VP_MAX_BYTES:
+                return web.json_response({"ok": False, "msg": "音频超过 50MB 限制"})
+            if len(audio_data) < 1000:
+                return web.json_response({"ok": False, "msg": "音频文件过小，请检查"})
+
+            # 保存到 <temp_dir>/<姓名>/<时间戳>.<ext>
+            spk_dir = self.temp_vp_dir / name
+            spk_dir.mkdir(parents=True, exist_ok=True)
+            filename = time.strftime("%Y%m%d_%H%M%S") + audio_ext
+            path = spk_dir / filename
+            path.write_bytes(audio_data)
+            LOG.info("声纹已保存: %s (%d bytes)", path, len(audio_data))
+
+            # 通知 serve 热重载（会话在线时立即；否则记录待重载标记）
+            reloaded = False
+            if self._session is not None and self._session.active:
+                self._session.send_control({"type": "reload_voiceprints"})
+                reloaded = True
+            else:
+                self._pending_vp_reload = True
+                LOG.info("无会话，标记待重载")
+            return web.json_response(
+                {"ok": True, "path": str(path), "speaker": name, "reloaded": reloaded}
+            )
+
         app.router.add_get("/", index)
         app.router.add_get("/index.html", index)
         app.router.add_get("/api/sessions", api_sessions)
         app.router.add_get("/api/sessions/{sid}", api_session_detail)
         app.router.add_get("/api/sessions/{sid}/files/{kind}", api_session_file)
         app.router.add_delete("/api/sessions/{sid}", api_session_delete)
+        app.router.add_get("/api/voiceprints", api_voiceprints_list)
+        app.router.add_post("/api/voiceprints", api_voiceprints_add)
+        app.router.add_delete("/api/voiceprints/{name}", api_voiceprints_delete)
         app.router.add_get(BROWSER_WS, self._ws_handler)
         return app
 
@@ -577,6 +779,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--log-dir", default="logs", type=str, help="会话日志目录 (default: logs)"
     )
     parser.add_argument("--open", action="store_true", help="启动后自动打开浏览器")
+    parser.add_argument(
+        "--verify-mode",
+        default="verify",
+        type=str,
+        choices=["verify", "identify"],
+        help="默认说话人模式：verify=确认 / identify=识别（open-set）。"
+        "运行中可在页面切换（需上游 serve 支持，serve 需以对应 --verify-mode 启动）",
+    )
+    parser.add_argument(
+        "--temp-voiceprint-dir",
+        default=None,
+        type=str,
+        help="临时声纹库目录（需与 serve 的 --temp-voiceprint-dir 一致）。"
+        "提供后页面可上传添加声纹，保存后自动通知 serve 热重载",
+    )
     parser.add_argument("--verbose", action="store_true", help="输出调试日志")
     return parser
 

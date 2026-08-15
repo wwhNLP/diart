@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import SimpleQueue
-from typing import Text, Optional, AnyStr, Dict, Any, Union, Tuple
+from typing import Text, Optional, AnyStr, Callable, Dict, Any, Union, Tuple
 
+import json
 import numpy as np
 import sounddevice as sd
 import torch
@@ -234,6 +235,7 @@ class WebSocketAudioSource(AudioSource):
         #  I would prefer the client to send a JSON with data and sample rate, then resample if needed
         super().__init__(f"{host}:{port}", sample_rate)
         self.client: Optional[Dict[Text, Any]] = None
+        self.on_control: Optional[Callable[[Dict[Text, Any]], None]] = None
         self.server = WebsocketServer(host, port, key=key, cert=certificate)
         self.server.set_fn_message_received(self._on_message_received)
 
@@ -246,8 +248,45 @@ class WebSocketAudioSource(AudioSource):
         # Only one client at a time is allowed
         if self.client is None or self.client["id"] != client["id"]:
             self.client = client
+        # 控制消息优先：JSON dict 且为已注册的控制类型（如 {"type": "mode", ...}），
+        # 其余一律按音频 base64 解码（双条件判定，避免音频串被误判）
+        ctrl = self._try_parse_control(message)
+        if ctrl is not None:
+            if self.on_control is not None:
+                self.on_control(ctrl)
+            else:
+                print(
+                    f"[diart] 收到控制消息 {ctrl} 但未启用说话人确认"
+                    "（serve 需以 --voiceprint-dir 启动）",
+                    flush=True,
+                )
+            return
         # Send decoded audio to pipeline
         self.stream.on_next(utils.decode_audio(message))
+
+    @staticmethod
+    def _try_parse_control(message: AnyStr) -> Optional[Dict[Text, Any]]:
+        """尝试把消息解析为控制消息；非控制消息返回 None。
+
+        双条件判定：必须是 JSON dict、type 为已知控制类型、且字段合法，
+        任一不满足即视为音频（base64 串极少能被解析为这种 dict）。
+        """
+        if not isinstance(message, str):
+            return None
+        try:
+            data = json.loads(message)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        mtype = data.get("type")
+        if mtype == "mode":
+            mode = data.get("mode")
+            if mode in ("verify", "identify"):
+                return {"type": "mode", "mode": mode}
+        if mtype == "reload_voiceprints":
+            return {"type": "reload_voiceprints"}
+        return None
 
     def read(self):
         """Starts running the websocket server and listening for audio chunks"""

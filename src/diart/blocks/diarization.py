@@ -4,6 +4,7 @@ from typing import Sequence
 
 import numpy as np
 import torch
+from pathlib import Path
 from pyannote.core import Annotation, SlidingWindowFeature, SlidingWindow, Segment
 from pyannote.metrics.base import BaseMetric
 from pyannote.metrics.diarization import DiarizationErrorRate
@@ -37,9 +38,12 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
         device: torch.device | None = None,
         sample_rate: int = 16000,
         voiceprint_dir: str | None = None,
+        temp_voiceprint_dir: str | None = None,
         verify_threshold: float = 0.5,
         verify_min_chunks: int = 3,
         verify_ema_alpha: float = 0.3,
+        verify_mode: str = "verify",
+        identify_min_similarity: float | None = None,
         **kwargs,
     ):
         # Default segmentation model is pyannote/segmentation
@@ -76,9 +80,14 @@ class SpeakerDiarizationConfig(base.PipelineConfig):
 
         # 流式说话人确认参数（voiceprint_dir 为 None 时关闭）
         self.voiceprint_dir = voiceprint_dir
+        self.temp_voiceprint_dir = temp_voiceprint_dir
         self.verify_threshold = verify_threshold
         self.verify_min_chunks = verify_min_chunks
         self.verify_ema_alpha = verify_ema_alpha
+        # 双模式：verify（确认，默认）/ identify（识别，open-set）
+        assert verify_mode in ("verify", "identify"), "verify_mode 只能是 verify / identify"
+        self.verify_mode = verify_mode
+        self.identify_min_similarity = identify_min_similarity
 
     @property
     def duration(self) -> float:
@@ -132,12 +141,20 @@ class SpeakerDiarization(base.Pipeline):
         # 流式说话人确认器（说话人确认功能）
         self.verifier = None
         self.verification: dict = {}
+        self._voiceprint_provider = None
         if self._config.voiceprint_dir is not None:
+            directories = [self._config.voiceprint_dir]
+            if self._config.temp_voiceprint_dir is not None:
+                temp_dir = Path(self._config.temp_voiceprint_dir)
+                temp_dir.mkdir(parents=True, exist_ok=True)
+                directories.append(str(temp_dir))
+                print(f"[说话人确认] 临时声纹库: {temp_dir}（与主库合并注册）")
             provider = verification.DirectoryVoiceprints(
-                self._config.voiceprint_dir,
+                directories,
                 self.embedding.embedding.model,
                 device=self._config.device,
             )
+            self._voiceprint_provider = provider
             voiceprints = provider.load()
             if voiceprints:
                 self.verifier = verification.StreamingSpeakerVerifier(
@@ -146,11 +163,14 @@ class SpeakerDiarization(base.Pipeline):
                     min_chunks=self._config.verify_min_chunks,
                     ema_alpha=self._config.verify_ema_alpha,
                     max_speakers=self._config.max_speakers,
+                    mode=self._config.verify_mode,
+                    identify_min_similarity=self._config.identify_min_similarity,
                 )
                 print(
                     f"[说话人确认] 已加载 {len(voiceprints)} 个注册说话人, "
                     f"阈值 {self._config.verify_threshold}, "
-                    f"确认所需连续chunk数 {self._config.verify_min_chunks}"
+                    f"确认所需连续chunk数 {self._config.verify_min_chunks}, "
+                    f"模式 {self._config.verify_mode}"
                 )
             else:
                 print("[说话人确认] 警告: 声纹库为空，说话人确认已禁用")
@@ -179,6 +199,15 @@ class SpeakerDiarization(base.Pipeline):
 
     def set_timestamp_shift(self, shift: float):
         self.timestamp_shift = shift
+
+    def reload_voiceprints(self):
+        """热重载声纹库（主库 + 临时库重新扫描），保留已确认状态。"""
+        if self.verifier is None or self._voiceprint_provider is None:
+            print("[说话人确认] 未启用声纹确认，忽略重载请求")
+            return
+        self._voiceprint_provider.refresh()
+        voiceprints = self._voiceprint_provider.load()
+        self.verifier.update_voiceprints(voiceprints)
 
     def reset(self):
         self.set_timestamp_shift(0)
@@ -257,14 +286,24 @@ class SpeakerDiarization(base.Pipeline):
                     self.clustering.centers, self.clustering.active_centers
                 )
                 agg_prediction = self.verifier.rename_annotation(agg_prediction)
-            self.verification = {
-                g_spk: {
-                    "name": v.name,
-                    "id": v.id,
-                    "similarity": v.similarity,
+            # 输出属性：verify 模式 -> 确认映射；identify 模式 -> Top-1 识别映射（含 top3）
+            if self.verifier is not None:
+                source = (
+                    self.verifier.confirmed
+                    if self.verifier.mode == "verify"
+                    else self.verifier.identifications
+                )
+                self.verification = {
+                    g_spk: {
+                        "name": v.name,
+                        "id": v.id,
+                        "similarity": v.similarity,
+                        "top3": [(n, s) for n, s in v.top3],
+                    }
+                    for g_spk, v in source.items()
                 }
-                for g_spk, v in self.verifier.confirmed.items()
-            } if self.verifier is not None else {}
+            else:
+                self.verification = {}
             agg_prediction.speaker_verification = dict(self.verification)
 
             # Shift prediction timestamps if required

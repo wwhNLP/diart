@@ -94,7 +94,7 @@ class DirectoryVoiceprints(VoiceprintProvider):
 
     def __init__(
         self,
-        directory: str | Path,
+        directory: str | Path | list[str | Path],
         embedding_model,
         device=None,
         window: float = 3.0,
@@ -102,8 +102,13 @@ class DirectoryVoiceprints(VoiceprintProvider):
         max_audio_seconds: float = 30.0,
         sample_rate: int = 16000,
     ):
-        self.directory = Path(directory)
-        assert self.directory.is_dir(), f"声纹库目录不存在: {self.directory}"
+        # 支持单目录（兼容旧用法）或多目录（主库 + 临时库）
+        if isinstance(directory, (str, Path)):
+            self.directories = [Path(directory)]
+        else:
+            self.directories = [Path(d) for d in directory]
+        for d in self.directories:
+            assert d.is_dir(), f"声纹库目录不存在: {d}"
         self.embedding_model = embedding_model
         self.device = device
         self.window = window
@@ -112,53 +117,68 @@ class DirectoryVoiceprints(VoiceprintProvider):
         self.sample_rate = sample_rate
         self._cache: list[RegisteredSpeaker] | None = None
 
+    def refresh(self):
+        """清空缓存，下次 load() 重新扫描（热重载用）。"""
+        self._cache = None
+
     def load(self) -> list[RegisteredSpeaker]:
-        """扫描目录并提取声纹（结果缓存，重复调用不重复计算）。"""
+        """扫描目录并提取声纹（结果缓存，refresh() 后重新计算）。
+
+        多目录时按说话人姓名合并：同名说话人的声纹行拼接（主库 + 临时库
+        的增量声纹合为一个注册说话人）。
+        """
         if self._cache is not None:
             return self._cache
 
         import torch
         import torchaudio
 
-        speakers: list[RegisteredSpeaker] = []
-        folders = sorted(
-            [f for f in self.directory.iterdir() if f.is_dir()]
-        )
-        for folder in folders:
-            name = folder.name
-            wav_files = sorted(
-                [
-                    f
-                    for f in folder.iterdir()
-                    if f.is_file()
-                    and f.suffix.lower() in self.SUPPORTED_EXTENSIONS
-                ]
-            )
-            if not wav_files:
-                continue
-            all_embeddings: list[np.ndarray] = []
-            for wav_path in wav_files:
-                waveform, sr = torchaudio.load(str(wav_path))
-                if waveform.shape[0] > 1:
-                    waveform = waveform.mean(dim=0, keepdim=True)
-                if sr != self.sample_rate:
-                    waveform = torchaudio.functional.resample(
-                        waveform, sr, self.sample_rate
-                    )
-                audio = waveform[0].float()  # (samples,)
-                if audio.numel() < int(0.1 * self.sample_rate):
+        by_name: dict[str, list[np.ndarray]] = {}
+        for directory in self.directories:
+            folders = sorted([f for f in directory.iterdir() if f.is_dir()])
+            for folder in folders:
+                name = folder.name
+                wav_files = sorted(
+                    [
+                        f
+                        for f in folder.iterdir()
+                        if f.is_file()
+                        and f.suffix.lower() in self.SUPPORTED_EXTENSIONS
+                    ]
+                )
+                if not wav_files:
                     continue
-                audio = audio[: int(self.max_audio_seconds * self.sample_rate)]
-                all_embeddings.extend(self._extract_sliding_windows(audio))
-            valid = [e for e in all_embeddings if np.all(np.isfinite(e))]
-            if not valid:
-                print(f"[声纹注册] 跳过 {name}: 未能提取到有效声纹")
-                continue
-            matrix = _l2_normalize(np.vstack(valid))
+                all_embeddings: list[np.ndarray] = []
+                for wav_path in wav_files:
+                    waveform, sr = torchaudio.load(str(wav_path))
+                    if waveform.shape[0] > 1:
+                        waveform = waveform.mean(dim=0, keepdim=True)
+                    if sr != self.sample_rate:
+                        waveform = torchaudio.functional.resample(
+                            waveform, sr, self.sample_rate
+                        )
+                    audio = waveform[0].float()  # (samples,)
+                    if audio.numel() < int(0.1 * self.sample_rate):
+                        continue
+                    audio = audio[: int(self.max_audio_seconds * self.sample_rate)]
+                    all_embeddings.extend(self._extract_sliding_windows(audio))
+                valid = [e for e in all_embeddings if np.all(np.isfinite(e))]
+                if valid:
+                    by_name.setdefault(name, []).extend(valid)
+                else:
+                    print(
+                        f"[声纹注册] 警告: 跳过 {name} ({wav_path.name}): "
+                        "未能提取到有效声纹（音频过短或格式异常）",
+                        flush=True,
+                    )
+
+        speakers: list[RegisteredSpeaker] = []
+        for name in sorted(by_name):
+            matrix = _l2_normalize(np.vstack(by_name[name]))
             speakers.append(RegisteredSpeaker(name=name, embeddings=matrix))
             print(
-                f"[声纹注册] {name}: {len(wav_files)} 个文件, "
-                f"{matrix.shape[0]} 条声纹, {matrix.shape[1]} 维"
+                f"[声纹注册] {name}: {matrix.shape[0]} 条声纹, "
+                f"{matrix.shape[1]} 维"
             )
 
         self._cache = speakers
@@ -270,11 +290,13 @@ class DBVoiceprints(VoiceprintProvider):
 
 @dataclass
 class VerifiedSpeaker:
-    """一个已确认的说话人。"""
+    """一个已确认/已识别的说话人。"""
 
     name: str
     similarity: float
     id: str = ""
+    # 识别模式下的 Top-N 候选：[(名字, 相似度), ...]（不含 Top-1）
+    top3: list = field(default_factory=list)
 
 
 class _PendingState:
@@ -290,7 +312,7 @@ class _PendingState:
 
 
 class StreamingSpeakerVerifier:
-    """流式说话人确认状态机。
+    """流式说话人确认/识别状态机（双模式）。
 
     每个 chunk 调用一次 :meth:`update`，传入说话人聚类累积质心
     （``OnlineSpeakerClustering.centers``，未归一化的 embedding 和）与
@@ -298,27 +320,35 @@ class StreamingSpeakerVerifier:
 
     1. 质心 L2 归一化，与注册声纹矩阵批量余弦匹配（取最相似的一条注册声纹）
     2. 相似度 EMA 平滑，防止单 chunk 抖动
-    3. 连续 ``min_chunks`` 次平滑相似度 >= threshold 后确认（进入 confirmed）
+    3. 按模式决定标签替换规则：
+       - verify（确认，默认）：连续 ``min_chunks`` 次平滑相似度 >= threshold
+         才确认替换；确认后持续不达标自动撤销、恢复 speakerX 标签
+       - identify（识别，open-set）：无 min_chunks 门禁，每 chunk 即时按
+         EMA 平滑后的 Top-1 匹配替换；相似度 < 门禁（默认同 threshold）
+         保持 speakerX，Top-1 变化时名字立即跟随
 
-    未确认（未注册）的说话人不会被替换标签；已确认的说话人若相似度
-    持续低于阈值（连续 ``unconfirm_min_chunks`` 次），自动撤销确认并
-    恢复原始 speakerX 标签。
+    两种模式均可通过 :meth:`set_mode` 运行中切换，EMA 状态保留。
 
     Parameters
     ----------
     voiceprints: list[RegisteredSpeaker]
         注册声纹库（向量已 L2 归一化）。
     threshold: float
-        余弦相似度确认阈值，默认 0.5（EER 校准值，见
+        余弦相似度阈值，默认 0.5（EER 校准值，见
         scripts/calibrate_threshold.py；参考项目经验值为 0.4）。
     min_chunks: int
-        确认所需连续命中 chunk 数，默认 3。
+        确认模式：确认所需连续命中 chunk 数（=撤销所需连续不达标数），默认 3。
     ema_alpha: float
         相似度 EMA 平滑系数，默认 0.3。
     max_speakers: int
         与管道 max_speakers 一致（质心矩阵行数），默认 20。
     unconfirm_min_chunks: int | None
-        撤销确认所需连续不达标 chunk 数，默认与 min_chunks 相同。
+        确认模式：撤销确认所需连续不达标 chunk 数，默认与 min_chunks 相同。
+    mode: str
+        "verify"（确认）或 "identify"（识别，open-set），默认 "verify"。
+    identify_min_similarity: float | None
+        识别模式的替换门禁；None 时与 threshold 相同（open-set：低于门禁
+        保留 speakerX）。
     """
 
     def __init__(
@@ -329,6 +359,8 @@ class StreamingSpeakerVerifier:
         ema_alpha: float = 0.3,
         max_speakers: int = 20,
         unconfirm_min_chunks: int | None = None,
+        mode: str = "verify",
+        identify_min_similarity: float | None = None,
     ):
         assert voiceprints, "声纹库为空，无法进行说话人确认"
         self.voiceprints = voiceprints
@@ -342,6 +374,8 @@ class StreamingSpeakerVerifier:
             if unconfirm_min_chunks is None
             else max(1, int(unconfirm_min_chunks))
         )
+        self.mode = "verify"
+        self.identify_min_similarity = identify_min_similarity
 
         # 注册矩阵：(N, dim)，每行一条声纹；owners[i] 为行 i 所属说话人下标
         rows, owners = [], []
@@ -354,11 +388,38 @@ class StreamingSpeakerVerifier:
 
         self._state: dict[int, _PendingState] = {}
         self._confirmed: dict[int, VerifiedSpeaker] = {}
+        self._identifications: dict[int, VerifiedSpeaker] = {}
+        # 标签跟踪：g -> 当前输出标签（"speakerX" 或 人名），用于撤销/改名回切
+        self._label_state: dict[int, str] = {}
 
+        self.set_mode(mode)
+
+    # -- 模式 ------------------------------------------------------------ #
+    @property
+    def identify_gate(self) -> float:
+        """识别模式的替换门禁（open-set 下限）。"""
+        if self.identify_min_similarity is not None:
+            return self.identify_min_similarity
+        return self.threshold
+
+    def set_mode(self, mode: str) -> None:
+        """运行中切换模式（verify | identify），EMA 状态保留。"""
+        if mode not in ("verify", "identify"):
+            raise ValueError(f"未知模式: {mode}，可选 verify / identify")
+        if mode != self.mode:
+            self._label_state.clear()  # 标签语义变化，重置跟踪
+            self.mode = mode
+
+    # -- 状态视图 -------------------------------------------------------- #
     @property
     def confirmed(self) -> dict[int, VerifiedSpeaker]:
-        """已确认映射：{全局说话人下标 -> VerifiedSpeaker}。"""
+        """确认模式：已确认映射 {全局说话人下标 -> VerifiedSpeaker}。"""
         return self._confirmed
+
+    @property
+    def identifications(self) -> dict[int, VerifiedSpeaker]:
+        """识别模式：每 chunk 的 Top-1 识别映射（含 top3 候选）。"""
+        return self._identifications
 
     @property
     def pending(self) -> dict[int, tuple[str, float, int]]:
@@ -367,16 +428,20 @@ class StreamingSpeakerVerifier:
             g: (st.name, st.ema, st.hits) for g, st in self._state.items()
         }
 
+    # -- 每 chunk 更新 ---------------------------------------------------- #
     def update(
         self, centers: np.ndarray, active_speakers: set[int]
     ) -> dict[int, VerifiedSpeaker]:
-        """用当前质心更新确认状态，返回确认映射（可能新增确认项）。
+        """用当前质心更新状态，返回当前模式的识别/确认映射。
 
-        未注册（未确认）的说话人不会替换标签；已确认的说话人若相似度
-        持续低于阈值，会自动撤销确认并恢复原始 speakerX 标签。
+        verify 模式：未确认（未注册）不替换标签，误确认自动撤销恢复。
+        identify 模式：open-set 识别，每 chunk 即时输出 Top-1（EMA 平滑），
+        低于门禁保持 speakerX。
         """
         if self._matrix.shape[0] == 0:
-            return self._confirmed
+            return self._confirmed if self.mode == "verify" else self._identifications
+
+        topk = 3
         for g_spk in active_speakers:
             if g_spk >= centers.shape[0]:
                 continue
@@ -386,6 +451,35 @@ class StreamingSpeakerVerifier:
                 continue
             query = vec / norm
             similarities = query @ self._matrix.T
+            num = similarities.shape[0]
+
+            if self.mode == "identify":
+                # Top-3 候选（识别模式）
+                k = min(topk, num)
+                top_idx = np.argpartition(similarities, -k)[-k:]
+                top_idx = top_idx[np.argsort(-similarities[top_idx])]
+                best_index = int(top_idx[0])
+                best_sim = float(similarities[best_index])
+                owner = self.voiceprints[self._owners[best_index]]
+
+                state = self._state.get(g_spk)
+                if state is None or state.name != owner.name:
+                    state = _PendingState(owner.name, owner.id, best_sim)
+                else:
+                    state.ema = self.ema_alpha * best_sim + (1 - self.ema_alpha) * state.ema
+                self._state[g_spk] = state
+                self._identifications[g_spk] = VerifiedSpeaker(
+                    name=state.name,
+                    id=state.id,
+                    similarity=state.ema,
+                    top3=[
+                        (self.voiceprints[self._owners[int(i)]].name, float(similarities[i]))
+                        for i in top_idx[1:]
+                    ],
+                )
+                continue
+
+            # ---- verify 模式（原逻辑） ----
             best_index = int(np.argmax(similarities))
             best_sim = float(similarities[best_index])
             owner = self.voiceprints[self._owners[best_index]]
@@ -431,17 +525,93 @@ class StreamingSpeakerVerifier:
 
         return self._confirmed
 
+    # -- 标签改名 --------------------------------------------------------- #
+    def _build_rename_mapping(self) -> dict:
+        """按当前模式构建 {旧标签 -> 新标签} 映射。
+
+        注意：每 chunk 的聚合输出中，说话人段标签总是新的 "speakerX"
+        （聚类 -> binarize 生成），因此映射必须始终包含
+        {speakerX -> 目标名}；同时对滑动窗口中尚未滑出的、已被改名的
+        老段（标签为人名），提供 {旧人名 -> 新标签} 的改名/回切映射。
+        """
+        mapping: dict = {}
+        if self.mode == "verify":
+            # 已确认 -> 人名（新段 speakerX + 老段人名同步）
+            for g_spk, verified in self._confirmed.items():
+                mapping[f"speaker{g_spk}"] = verified.name
+                old = self._label_state.get(g_spk)
+                if old is not None and old != verified.name:
+                    mapping[old] = verified.name
+                self._label_state[g_spk] = verified.name
+            # 撤销恢复：曾改名但现在未确认的 -> 恢复 speakerX
+            for g_spk, old in list(self._label_state.items()):
+                if g_spk not in self._confirmed and old != f"speaker{g_spk}":
+                    mapping[old] = f"speaker{g_spk}"
+                    self._label_state[g_spk] = f"speaker{g_spk}"
+        else:
+            # identify：每 chunk 即时跟随 Top-1（open-set：低于门禁保持 speakerX）
+            gate = self.identify_gate
+            for g_spk, verified in self._identifications.items():
+                new = verified.name if verified.similarity >= gate else f"speaker{g_spk}"
+                mapping[f"speaker{g_spk}"] = new
+                old = self._label_state.get(g_spk)
+                if old is not None and old != new:
+                    mapping[old] = new
+                self._label_state[g_spk] = new
+        return mapping
+
     def rename_annotation(self, annotation) -> "Annotation":
-        """把已确认说话人的标签重命名为真实人名（原地修改）。"""
-        mapping = {
-            f"speaker{g_spk}": verified.name
-            for g_spk, verified in self._confirmed.items()
-        }
+        """按当前模式重命名标签（原地修改，含撤销恢复/改名回切）。"""
+        mapping = self._build_rename_mapping()
         if mapping:
             annotation.rename_labels(mapping=mapping, copy=False)
         return annotation
+
+    def update_voiceprints(self, voiceprints: list[RegisteredSpeaker]) -> None:
+        """热重载声纹库：重建注册矩阵，保留仍有效的确认/候选状态。
+
+        已确认/候选说话人若名字仍在新库中则保留（声纹行可能已扩充），
+        否则失效：确认的自动恢复 speakerX，候选的直接清除。
+        """
+        assert voiceprints, "声纹库为空，无法进行说话人确认"
+        self.voiceprints = voiceprints
+        rows, owners = [], []
+        for idx, spk in enumerate(voiceprints):
+            for embedding in spk.embeddings:
+                rows.append(embedding)
+                owners.append(idx)
+        self._matrix = np.vstack(rows) if rows else np.empty((0, 0), dtype=np.float32)
+        self._owners = np.asarray(owners, dtype=np.int64)
+
+        valid_names = {spk.name for spk in voiceprints}
+        # 失效的已确认说话人：标签恢复 speakerX
+        for g_spk in list(self._confirmed):
+            if self._confirmed[g_spk].name not in valid_names:
+                old = self._label_state.get(g_spk)
+                if old is not None and old != f"speaker{g_spk}":
+                    print(
+                        f"[声纹重载] speaker{g_spk} ({old}) 已从声纹库移除，恢复原标签",
+                        flush=True,
+                    )
+                self._label_state[g_spk] = f"speaker{g_spk}"
+                del self._confirmed[g_spk]
+        # 失效的候选状态清除
+        for g_spk in list(self._state):
+            if self._state[g_spk].name not in valid_names:
+                del self._state[g_spk]
+        # 失效的识别结果清除
+        for g_spk in list(self._identifications):
+            if self._identifications[g_spk].name not in valid_names:
+                del self._identifications[g_spk]
+        print(
+            f"[声纹重载] 声纹库已更新: {len(voiceprints)} 个说话人 "
+            f"(确认状态保留 {len(self._confirmed)} 个)",
+            flush=True,
+        )
 
     def reset(self):
         """重置状态（随管道 reset 调用）。"""
         self._state.clear()
         self._confirmed.clear()
+        self._identifications.clear()
+        self._label_state.clear()

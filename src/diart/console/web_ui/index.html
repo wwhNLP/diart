@@ -68,6 +68,10 @@ main{display:grid;grid-template-columns:300px minmax(0,1fr) 300px;gap:14px;flex:
 .btn:disabled{opacity:.45;cursor:not-allowed;transform:none}
 .btn.primary{background:linear-gradient(135deg,var(--accent),var(--accent-2));border-color:transparent;color:#fff;box-shadow:0 4px 16px rgba(91,140,255,.35)}
 .btn.primary:hover{filter:brightness(1.08)}
+.btn.active{background:linear-gradient(135deg,var(--accent),var(--accent-2));border-color:transparent;color:#fff}
+.vp-rec{display:flex;align-items:center;gap:8px;margin-top:8px}
+.vp-meter{flex:1;height:8px;border-radius:4px;background:var(--card-2);overflow:hidden;border:1px solid var(--line)}
+.vp-meter>span{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-2));transition:width .08s}
 .btn.danger{background:linear-gradient(135deg,#ef4444,#f97316);border-color:transparent;color:#fff;box-shadow:0 4px 16px rgba(239,68,68,.3)}
 .btn.danger:hover{filter:brightness(1.08)}
 .btn.ghost{background:transparent}
@@ -234,6 +238,32 @@ footer kbd{background:var(--card-2);border:1px solid var(--line);border-radius:5
         </div>
         <button class="btn sm" id="btn-apply" style="margin-top:8px" data-i18n="apply">应用配置</button>
         <div class="hint" data-i18n="serverHint">需先启动服务端：<b>diart serve</b>（默认端口 7007）。地址与端口在「应用配置」后对新会话生效。</div>
+        <div class="mode-switch" style="margin-top:10px">
+          <label data-i18n="spkMode" style="display:block;font-size:11px;color:var(--text-faint);margin-bottom:4px">说话人模式</label>
+          <div style="display:flex;gap:6px">
+            <button class="btn sm" id="mode-verify" data-i18n="modeVerify">✓ 确认</button>
+            <button class="btn sm" id="mode-identify" data-i18n="modeIdentify">识别</button>
+          </div>
+          <div class="hint" data-i18n="modeHint">确认：阈值门禁，未确认保持 speakerX；识别（open-set）：即时 Top-1 替换，低于门禁保持 speakerX。需 serve 以 --verify-mode 启动支持。</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3><span class="bar"></span><span data-i18n="addVp">添加声纹（临时库）</span></h3>
+        <div class="cfg-grid">
+          <input id="vp-name" placeholder="说话人姓名" spellcheck="false">
+          <input type="file" id="vp-file" accept="audio/*,.wav,.m4a,.mp3,.flac,.amr" style="font-size:11px">
+        </div>
+        <button class="btn sm" id="btn-add-vp" style="margin-top:8px" data-i18n="addVpBtn">＋ 添加声纹</button>
+        <div class="vp-rec">
+          <button class="btn sm" id="btn-vp-rec" data-i18n="vpRecStart">🎙 录音</button>
+          <span class="led-label" id="vp-rec-time">0.0s</span>
+          <span class="vp-meter"><span id="vp-meter-bar"></span></span>
+        </div>
+        <div class="hint" data-i18n="addVpHint">上传/录音后自动通知服务端热重载，新声纹立即参与识别。需 web_ui 与 serve 均以 --temp-voiceprint-dir 启动。录音建议 5–15 秒。</div>
+        <ul id="vp-list" style="margin-top:8px;font-size:11.5px;color:var(--text-dim);list-style:none;padding:0">
+          <li data-i18n="vpEmpty">临时库未启用或为空</li>
+        </ul>
       </div>
 
       <div class="card">
@@ -336,6 +366,15 @@ const I18N = {
     dropHint:"拖拽音频文件到此处，或点击选择", pause:"暂停", resume:"继续", restart:"重播", max:"最大",
     stopSession:"⏹ 停止会话", serverCfg:"推理服务连接", apply:"应用配置",
     serverHint:"需先启动服务端：diart serve（默认端口 7007）。地址与端口在「应用配置」后对新会话生效。",
+    spkMode:"说话人模式", modeVerify:"✓ 确认", modeIdentify:"识别",
+    modeHint:"确认：阈值门禁，未确认保持 speakerX；识别（open-set）：即时 Top-1 替换，低于门禁保持 speakerX。需 serve 以 --verify-mode 启动支持。",
+    modeSwitched:"模式已切换",
+    addVp:"添加声纹（临时库）", addVpBtn:"＋ 添加声纹", addVpHint:"上传/录音后自动通知服务端热重载，新声纹立即参与识别。需 web_ui 与 serve 均以 --temp-voiceprint-dir 启动。录音建议 5–15 秒。",
+    vpEmpty:"临时库未启用或为空", vpNameEmpty:"请填写说话人姓名", vpNeedFile:"请选择音频文件",
+    vpUploading:"正在上传声纹…", vpAdded:"声纹已添加", vpReloaded:"，服务端已热重载", vpNotReloaded:"，会话未开始，将在下次会话重载",
+    vpListTitle:"临时声纹库", vpFiles:"段",
+    vpRecStart:"🎙 录音", vpRecStop:"⏹ 停止", vpRecTooShort:"录音太短，请至少 1 秒",
+    vpDelete:"删除", vpDeleteConfirm:"确定删除该说话人的全部临时声纹", vpDeleted:"临时声纹已删除",
     stats:"说话人统计", totalDur:"总时长", curSpk:"当前说话人", noData:"暂无数据，开始输入后显示",
     timeline:"说话人时间线", recognizedTo:"已识别至 {t}", follow:"跟随 ▶", unfollow:"跟随 ⏸",
     exportPng:"🖼 PNG", clear:"清空", historyReplay:"历史回放", backLive:"返回实时",
@@ -361,6 +400,15 @@ const I18N = {
     dropHint:"Drop audio file here, or click to browse", pause:"Pause", resume:"Resume", restart:"Restart", max:"Max",
     stopSession:"⏹ Stop Session", serverCfg:"Server Connection", apply:"Apply",
     serverHint:"Start the backend first: diart serve (default port 7007). New settings apply to the next session.",
+    spkMode:"Speaker Mode", modeVerify:"✓ Verify", modeIdentify:"Identify",
+    modeHint:"Verify: threshold-gated, unconfirmed stays speakerX; Identify (open-set): instant Top-1 replacement, below gate stays speakerX. Requires serve --verify-mode.",
+    modeSwitched:"Mode switched",
+    addVp:"Add Voiceprint (temp)", addVpBtn:"＋ Add", addVpHint:"Uploads/recordings are hot-reloaded on the server automatically. Requires --temp-voiceprint-dir on both web_ui and serve. Record 5–15 seconds.",
+    vpEmpty:"Temp library disabled or empty", vpNameEmpty:"Enter speaker name", vpNeedFile:"Choose an audio file",
+    vpUploading:"Uploading voiceprint…", vpAdded:"Voiceprint added", vpReloaded:", hot-reloaded on server", vpNotReloaded:", will reload on next session",
+    vpListTitle:"Temp Voiceprint Library", vpFiles:"files",
+    vpRecStart:"🎙 Record", vpRecStop:"⏹ Stop", vpRecTooShort:"Recording too short, need ≥1s",
+    vpDelete:"Delete", vpDeleteConfirm:"Delete all temp voiceprints of this speaker", vpDeleted:"Temp voiceprints deleted",
     stats:"Speaker Stats", totalDur:"Total", curSpk:"Current speaker", noData:"No data yet — start streaming",
     timeline:"Speaker Timeline", recognizedTo:"Recognized to {t}", follow:"Follow ▶", unfollow:"Follow ⏸",
     exportPng:"🖼 PNG", clear:"Clear", historyReplay:"History replay", backLive:"Back to live",
@@ -428,11 +476,31 @@ const S = {
   // 时间线
   pps:44, follow:true, replayId:null,
   audioCtx:null, replaySrc:null,
+  verifyMode:"verify",   // 说话人模式：verify（确认）| identify（识别）
 };
 const $ = id => document.getElementById(id);
 
 let pendingMode = "mic";
 let relayDownNotified = false;
+
+/* ---------------------- 说话人模式切换（确认/识别） ---------------------- */
+function setModeUI(){
+  const isV = S.verifyMode === "verify";
+  const bv = $("mode-verify"), bi = $("mode-identify");
+  if (!bv || !bi) return;
+  bv.classList.toggle("active", isV);
+  bi.classList.toggle("active", !isV);
+}
+function bindModeButtons(){
+  const bv = $("mode-verify"), bi = $("mode-identify");
+  if (!bv || !bi) return;
+  const send = mode => {
+    sendRelay({ type:"mode", mode });
+    toast(t("modeSwitched") + ": " + (mode === "verify" ? t("modeVerify") : t("modeIdentify")));
+  };
+  bv.onclick = () => send("verify");
+  bi.onclick = () => send("identify");
+}
 
 /* ================================================================
  * 中继连接
@@ -454,6 +522,10 @@ function connectRelay(){
       case "init":
         if (m.server_host){ $("cfg-host").value = m.server_host; $("cfg-port").value = m.server_port; }
         if (typeof m.server_online === "boolean"){ S.serverOnline = m.server_online; setServerBadge(); }
+        if (m.verify_mode){ S.verifyMode = m.verify_mode; setModeUI(); }
+        break;
+      case "mode":
+        if (m.mode && m.applied){ S.verifyMode = m.mode; setModeUI(); }
         break;
       case "status": onSessionStatus(m); break;
       case "rttm": handleRttmMsg(m.text, m.t); break;
@@ -1186,6 +1258,194 @@ $("btn-apply").onclick = () => {
   sendRelay({ type:"config", server_host:host, server_port:port });
   toast(t("apply") + ": " + host + ":" + port, "ok");
 };
+
+/* ================================================================
+ * 说话人模式切换（确认/识别）
+ * ================================================================ */
+bindModeButtons();
+setModeUI();
+
+/* ================================================================
+ * 添加声纹（临时库）
+ * ================================================================ */
+function refreshVpList(){
+  fetch("/api/voiceprints").then(r => r.json()).then(d => {
+    const ul = $("vp-list");
+    if (!ul) return;
+    ul.innerHTML = "";
+    if (!d.enabled || !d.speakers || d.speakers.length === 0){
+      const li = document.createElement("li");
+      li.textContent = t("vpEmpty");
+      ul.appendChild(li);
+      return;
+    }
+    const title = document.createElement("li");
+    title.style.fontWeight = "700";
+    title.textContent = t("vpListTitle") + " (" + d.speakers.length + ")";
+    ul.appendChild(title);
+    d.speakers.forEach(s => {
+      const li = document.createElement("li");
+      li.style.display = "flex";
+      li.style.alignItems = "center";
+      li.style.gap = "6px";
+      const label = document.createElement("span");
+      label.style.flex = "1";
+      label.textContent = "· " + s.name + " — " + s.files.length + " " + t("vpFiles");
+      const del = document.createElement("button");
+      del.className = "btn sm ghost";
+      del.style.padding = "2px 8px";
+      del.style.fontSize = "10.5px";
+      del.textContent = "🗑 " + t("vpDelete");
+      del.onclick = async () => {
+        if (!confirm(t("vpDeleteConfirm") + ": " + s.name + "?")) return;
+        try{
+          const res = await fetch("/api/voiceprints/" + encodeURIComponent(s.name), { method:"DELETE" });
+          const d2 = await res.json();
+          if (!d2.ok){ toast(d2.msg || "error", "error"); return; }
+          toast(t("vpDeleted") + ": " + s.name + (d2.reloaded ? t("vpReloaded") : t("vpNotReloaded")), "ok");
+          refreshVpList();
+        }catch(e){ toast("删除失败: " + e, "error"); }
+      };
+      li.appendChild(label);
+      li.appendChild(del);
+      ul.appendChild(li);
+    });
+  }).catch(() => {});
+}
+
+async function uploadVoiceprint(){
+  const name = ($("vp-name").value || "").trim();
+  const file = $("vp-file").files[0];
+  if (!name){ toast(t("vpNameEmpty"), "error"); return; }
+  if (!file){ toast(t("vpNeedFile"), "error"); return; }
+  const fd = new FormData();
+  fd.append("name", name);
+  fd.append("audio", file, file.name);
+  toast(t("vpUploading"));
+  try{
+    const res = await fetch("/api/voiceprints", { method:"POST", body: fd });
+    const d = await res.json();
+    if (!d.ok){ toast(d.msg || "error", "error"); return; }
+    toast(t("vpAdded") + ": " + d.speaker + (d.reloaded ? t("vpReloaded") : t("vpNotReloaded")), "ok");
+    $("vp-name").value = "";
+    $("vp-file").value = "";
+    refreshVpList();
+  }catch(e){
+    toast("上传失败: " + e, "error");
+  }
+}
+
+$("btn-add-vp").onclick = uploadVoiceprint;
+refreshVpList();
+
+/* ---- 麦克风录音录入声纹 ---- */
+const VP_REC_MAX_SEC = 15;   // 自动停止上限
+const VP_REC_MIN_SEC = 1.0;  // 最短有效录音
+let vpRec = null;            // {ctx, proc, stream, chunks:[], sr, startT, timer}
+
+function encodeWav(f32, sr){
+  // 16-bit PCM mono WAV（44 字节头）
+  const n = f32.length;
+  const buf = new ArrayBuffer(44 + n * 2);
+  const dv = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); dv.setUint32(4, 36 + n * 2, true); w(8, "WAVE");
+  w(12, "fmt "); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  w(36, "data"); dv.setUint32(40, n * 2, true);
+  let off = 44;
+  for (let i = 0; i < n; i++){
+    const s = Math.max(-1, Math.min(1, f32[i]));
+    dv.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    off += 2;
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+function vpRecUpdateTime(){
+  if (!vpRec) return;
+  const sec = (Date.now() - vpRec.startT) / 1000;
+  $("vp-rec-time").textContent = sec.toFixed(1) + "s";
+  if (sec >= VP_REC_MAX_SEC) stopVpRecord();
+}
+
+async function startVpRecord(){
+  if (vpRec) return;
+  const name = ($("vp-name").value || "").trim();
+  if (!name){ toast(t("vpNameEmpty"), "error"); return; }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount:1, echoCancellation:true, noiseSuppression:true, autoGainControl:true }
+    });
+  } catch(err){ toast(t("micError") + ": " + err.message, "error"); return; }
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  const ctx = new Ctx({ sampleRate: 16000 });
+  vpRec = { ctx, stream, chunks: [], sr: ctx.sampleRate, startT: Date.now(), timer: null };
+  try {
+    const src = ctx.createMediaStreamSource(stream);
+    const proc = ctx.createScriptProcessor(4096, 1, 1);
+    proc.onaudioprocess = e => {
+      if (!vpRec) return;
+      vpRec.chunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+      // 电平
+      const d = e.inputBuffer.getChannelData(0);
+      let sum = 0;
+      for (let i = 0; i < d.length; i += 4) sum += d[i] * d[i];
+      $("vp-meter-bar").style.width = Math.min(100, Math.round(Math.sqrt(sum / (d.length / 4)) * 500)) + "%";
+    };
+    const silence = ctx.createGain(); silence.gain.value = 0;
+    src.connect(proc); proc.connect(silence); silence.connect(ctx.destination);
+    vpRec.proc = proc;
+  } catch(err){
+    stopVpRecord(true);
+    toast(t("micStartErr") + ": " + err.message, "error");
+    return;
+  }
+  $("btn-vp-rec").textContent = t("vpRecStop");
+  $("btn-vp-rec").classList.add("danger");
+  vpRec.timer = setInterval(vpRecUpdateTime, 100);
+  toast(t("vpRecStart") + "…");
+}
+
+function stopVpRecord(cancel){
+  if (!vpRec) return;
+  const rec = vpRec; vpRec = null;
+  clearInterval(rec.timer);
+  try{ rec.proc.disconnect(); }catch(e){}
+  try{ rec.ctx.close(); }catch(e){}
+  try{ rec.stream.getTracks().forEach(t => t.stop()); }catch(e){}
+  $("btn-vp-rec").textContent = t("vpRecStart");
+  $("btn-vp-rec").classList.remove("danger");
+  $("vp-meter-bar").style.width = "0";
+  if (cancel) return;
+  // 拼接 PCM -> WAV -> 上传
+  const total = rec.chunks.reduce((a, c) => a + c.length, 0);
+  const secs = total / rec.sr;
+  if (secs < VP_REC_MIN_SEC){ toast(t("vpRecTooShort") + " (" + secs.toFixed(1) + "s)", "error"); return; }
+  const pcm = new Float32Array(total);
+  let off = 0;
+  for (const c of rec.chunks){ pcm.set(c, off); off += c.length; }
+  const blob = encodeWav(pcm, rec.sr);
+  const name = ($("vp-name").value || "").trim();
+  uploadVoiceprintBlob(blob, name);
+}
+
+async function uploadVoiceprintBlob(blob, name){
+  const fd = new FormData();
+  fd.append("name", name);
+  fd.append("audio", blob, name + "_mic.wav");
+  toast(t("vpUploading"));
+  try{
+    const res = await fetch("/api/voiceprints", { method:"POST", body: fd });
+    const d = await res.json();
+    if (!d.ok){ toast(d.msg || "error", "error"); return; }
+    toast(t("vpAdded") + ": " + d.speaker + (d.reloaded ? t("vpReloaded") : t("vpNotReloaded")), "ok");
+    refreshVpList();
+  }catch(e){ toast("上传失败: " + e, "error"); }
+}
+
+$("btn-vp-rec").onclick = () => { if (vpRec) stopVpRecord(); else startVpRecord(); };
 
 /* ================================================================
  * 快捷键

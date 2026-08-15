@@ -160,7 +160,7 @@ class StreamingInference:
         self, *hooks: Callable[[tuple[Annotation, SlidingWindowFeature]], None]
     ):
         """Attach hooks to the pipeline.
-
+        
         Parameters
         ----------
         *hooks: (Tuple[Annotation, SlidingWindowFeature]) -> None
@@ -213,7 +213,7 @@ class StreamingInference:
             self._pbar.start()
         config = self.pipeline.config
         observable = self.stream
-        if self.do_plot:
+        if self.do_plot:  #绘图脚本
             # Buffering is needed for the real-time plot, so we do this at the very end
             observable = self.stream.pipe(
                 dops.buffer_output(

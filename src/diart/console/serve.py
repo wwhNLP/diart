@@ -169,6 +169,13 @@ def run():
         help="声纹库目录 (<dir>/<说话人姓名>/*.wav)。提供后启用流式说话人确认",
     )
     parser.add_argument(
+        "--temp-voiceprint-dir",
+        default=None,
+        type=str,
+        help="临时声纹库目录（可选）。与主声纹库合并注册，用于运行时添加声纹"
+        "（web 控制台上传），支持热重载",
+    )
+    parser.add_argument(
         "--verify-threshold",
         default=0.5,
         type=float,
@@ -192,6 +199,14 @@ def run():
         action="store_false",
         help="禁用流式说话人确认",
     )
+    parser.add_argument(
+        "--verify-mode",
+        default="verify",
+        type=str,
+        choices=["verify", "identify"],
+        help="说话人模式：verify=确认（阈值门禁，默认）；identify=识别（open-set，"
+        "即时 Top-1 替换，低于门禁保持 speakerX）。运行中可通过 WS 控制消息切换",
+    )
     args = parser.parse_args()
     if not args.verify:
         args.voiceprint_dir = None
@@ -209,8 +224,25 @@ def run():
     config = pipeline_class.get_config_class()(**vars(args))
     pipeline = pipeline_class(config)
 
-    # Create websocket audio source
+    # 创建 websocket audio source
     audio_source = src.WebSocketAudioSource(config.sample_rate, args.host, args.port)
+
+    # 流式说话人确认：双模式（verify/identify）+ 运行中 WS 控制切换
+    if pipeline.verifier is not None:
+        pipeline.verifier.set_mode(args.verify_mode)
+
+        def _on_control(ctrl: dict):
+            ctype = ctrl.get("type")
+            if ctype == "mode":
+                mode = ctrl["mode"]
+                pipeline.verifier.set_mode(mode)
+                print(f"[说话人确认] 运行中切换模式 -> {mode}", flush=True)
+            elif ctype == "reload_voiceprints":
+                pipeline.reload_voiceprints()
+            else:
+                print(f"[说话人确认] 未知控制消息: {ctrl}", flush=True)
+
+        audio_source.on_control = _on_control
 
     # Run online inference
     inference = StreamingInference(
