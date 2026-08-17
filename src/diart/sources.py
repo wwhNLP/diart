@@ -254,8 +254,9 @@ class WebSocketAudioSource(AudioSource):
         if ctrl is not None:
             if ctrl.get("type") == "unknown":
                 # 合法 JSON dict 但非已知控制类型：不能按 base64 音频解码
-                # （JSON 字符不在 base64 字母表，会抛 binascii.Error），安全忽略
-                print(f"[diart] 忽略未知控制消息: {message}", flush=True)
+                # （JSON 字符不在 base64 字母表，会抛 binascii.Error），安全忽略。
+                # 截断 + repr 转义：消息内容可能含超长文本/终端转义序列（日志注入）
+                print(f"[diart] 忽略未知控制消息: {message[:200]!r}", flush=True)
                 return
             if self.on_control is not None:
                 self.on_control(ctrl)

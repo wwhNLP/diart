@@ -24,11 +24,12 @@ cd "$PROJECT_DIR"
 
 THRESHOLDS="${1:-0.5}"
 OUT="docs/results/reproduce"
-# 便携解释器：优先 $PYTHON 环境变量，其次 PATH 中的 python
-PYTHON="${PYTHON:-$(command -v python)}"
+# 便携解释器：优先 $PYTHON 环境变量，其次 PATH 中的 python/python3
+# （set -e 下 command -v 失败会中止脚本，需 || true 让友好报错生效）
+PYTHON="${PYTHON:-$(command -v python || command -v python3 || true)}"
 
-# 阈值校验：非空、逗号分隔的 [0,1] 小数列表（避免跑完才在深处报 float() 错误）
-if ! [[ "${THRESHOLDS}" =~ ^0(\.[0-9]+)?(,0(\.[0-9]+)?)*$ ]]; then
+# 阈值校验：非空、逗号分隔的 [0,1] 小数列表（允许 1 / 1.0）
+if ! [[ "${THRESHOLDS}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)(,(0(\.[0-9]+)?|1(\.0+)?))*$ ]]; then
     echo "✗ 非法阈值列表: ${THRESHOLDS}（示例: 0.5 或 0.4,0.47,0.5）"
     exit 1
 fi

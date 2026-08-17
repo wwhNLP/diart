@@ -326,6 +326,7 @@ footer kbd{background:var(--card-2);border:1px solid var(--line);border-radius:5
           <button class="btn sm" id="dl-rttm" data-i18n="dlRttm">RTTM</button>
           <button class="btn sm" id="dl-log" data-i18n="dlLog">日志</button>
           <button class="btn sm" id="dl-json" data-i18n="dlJson">JSON</button>
+          <button class="btn sm" id="dl-audio" data-i18n="dlAudio">🎵 音频</button>
         </div>
       </div>
 
@@ -380,7 +381,7 @@ const I18N = {
     exportPng:"🖼 PNG", clear:"清空", historyReplay:"历史回放", backLive:"返回实时",
     rawRttm:"原始 RTTM 流", copy:"复制", copied:"已复制",
     curSession:"当前会话", sessionId:"会话 ID", mode:"输入模式", status:"状态",
-    started:"开始时间", lines:"RTTM 行数", dlRttm:"RTTM", dlLog:"日志", dlJson:"JSON",
+    started:"开始时间", lines:"RTTM 行数", dlRttm:"RTTM", dlLog:"日志", dlJson:"JSON", dlAudio:"音频",
     history:"历史会话", refresh:"刷新", noHistory:"暂无历史会话",
     shortcuts:"快捷键", scStart:"开始/停止", scLog:"下载日志", scTheme:"切换主题",
     // 状态
@@ -414,7 +415,7 @@ const I18N = {
     exportPng:"🖼 PNG", clear:"Clear", historyReplay:"History replay", backLive:"Back to live",
     rawRttm:"Raw RTTM Stream", copy:"Copy", copied:"Copied",
     curSession:"Current Session", sessionId:"Session ID", mode:"Mode", status:"Status",
-    started:"Started", lines:"RTTM lines", dlRttm:"RTTM", dlLog:"Log", dlJson:"JSON",
+    started:"Started", lines:"RTTM lines", dlRttm:"RTTM", dlLog:"Log", dlJson:"JSON", dlAudio:"Audio",
     history:"History", refresh:"Refresh", noHistory:"No sessions yet",
     shortcuts:"Shortcuts", scStart:"Start/Stop", scLog:"Download log", scTheme:"Toggle theme",
     st_connecting:"Connecting", st_online:"Online", st_offline:"Offline", st_stopped:"Stopped", st_idle:"Idle",
@@ -528,7 +529,10 @@ function connectRelay(){
         if (m.mode && m.applied){ S.verifyMode = m.mode; setModeUI(); }
         break;
       case "status": onSessionStatus(m); break;
-      case "rttm": handleRttmMsg(m.text, m.t); break;
+      case "rttm":
+        // 历史回放期间忽略 live 消息，避免穿插进回放批次污染时间线
+        if (!S.replayId) handleRttmMsg(m.text, m.t);
+        break;
       case "server": S.serverOnline = m.online; setServerBadge(); break;
       case "error": toast(m.msg, "error"); break;
     }
@@ -822,7 +826,31 @@ function clearTimeline(){
 /* ================================================================
  * 片段音频回放（浏览器本地缓冲）
  * ================================================================ */
-function replaySegment(seg, el){
+async function replaySegment(seg, el){
+  // 优先：从服务端保存的会话音频拉取片段（支持任意历史时刻，含进行中会话）
+  const sid = S.session && S.session.id;
+  if (sid){
+    try{
+      const url = `/api/sessions/${encodeURIComponent(sid)}/audio?start=${seg.start.toFixed(3)}&end=${(seg.start + seg.dur).toFixed(3)}`;
+      const res = await fetch(url);
+      if (res.ok){
+        const ab = await res.arrayBuffer();
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!S.audioCtx) S.audioCtx = new Ctx();
+        if (S.audioCtx.state === "suspended") S.audioCtx.resume();
+        const audioBuf = await S.audioCtx.decodeAudioData(ab);
+        stopReplay();
+        const src = S.audioCtx.createBufferSource();
+        src.buffer = audioBuf; src.connect(S.audioCtx.destination);
+        src.onended = () => { S.replaySrc = null; el && el.classList.remove("active"); };
+        src.start();
+        S.replaySrc = src;
+        el && el.classList.add("active");
+        return;
+      }
+    }catch(e){ /* 服务端不可用/解码失败，回退内存缓冲 */ }
+  }
+  // 回退：内存缓冲（麦克风环形缓冲 / 文件缓冲）
   let data = null;
   if (S.session && S.session.mode === "mic" && S.micRing) data = ringSlice(seg.start, seg.start + seg.dur);
   else if (S.fileBuf) data = S.fileBuf.subarray(Math.max(0, Math.round(seg.start*SR)), Math.min(S.fileTotal, Math.round((seg.start+seg.dur)*SR)));
@@ -955,11 +983,14 @@ async function startMic(){
   S.micStream = stream;
   S.micOn = true;
   pendingMode = "mic";
+  // 新会话开始：退出历史回放状态（否则剪枝豁免/光标隐藏会残留整个会话）
+  S.replayId = null;
+  $("replay-banner").style.display = "none";
   const Ctx = window.AudioContext || window.webkitAudioContext;
   S.micCtx = new Ctx({ sampleRate: 16000 });
   // getUserMedia 之后创建 AudioContext 可能因失去用户手势而处于 suspended，
-  // 此时 onaudioprocess 不会触发、会话静默无声音；显式 resume
-  if (S.micCtx.state === "suspended") S.micCtx.resume();
+  // 此时 onaudioprocess 不会触发、会话静默无声音；显式 resume（拒绝时静默降级）
+  if (S.micCtx.state === "suspended") S.micCtx.resume().catch(() => {});
   S.micRaw = new Float32Array(Math.round(S.micCtx.sampleRate * 0.5));
   S.micRawLen = 0;
   S.micSentTotal = 0;
@@ -1103,6 +1134,9 @@ async function loadFile(file){
   } catch(err){ toast(t("micStartErr") + ": " + err.message, "error"); return; }
   if (decoded.duration < 5.5) toast(t("fileTooShort"), "warn");
   pendingMode = "file";
+  // 新会话开始：退出历史回放状态（同 startMic）
+  S.replayId = null;
+  $("replay-banner").style.display = "none";
   try {
     S.fileBuf = await resampleTo16k(decoded);
   } catch(err){
@@ -1247,12 +1281,16 @@ function renderHistory(sessions){
         <button class="btn xs" data-act="rttm">RTTM</button>
         <button class="btn xs" data-act="log">${t("dlLog")}</button>
         <button class="btn xs" data-act="json">JSON</button>
+        ${s.has_audio ? `<button class="btn xs" data-act="audio">🎵 ${t("dlAudio")}</button>` : ""}
         <button class="btn xs danger" data-act="del">✕</button>
       </div>`;
     li.querySelector('[data-act="replay"]').onclick = () => replayHistory(s.id);
     li.querySelector('[data-act="rttm"]').onclick = () => window.open(`/api/sessions/${s.id}/files/rttm`, "_blank");
     li.querySelector('[data-act="log"]').onclick = () => window.open(`/api/sessions/${s.id}/files/log`, "_blank");
     li.querySelector('[data-act="json"]').onclick = () => window.open(`/api/sessions/${s.id}/files/json`, "_blank");
+    if (s.has_audio){
+      li.querySelector('[data-act="audio"]').onclick = () => window.open(`/api/sessions/${s.id}/files/audio`, "_blank");
+    }
     li.querySelector('[data-act="del"]').onclick = async () => {
       await fetch(`/api/sessions/${s.id}`, { method:"DELETE" });
       refreshHistory();
@@ -1297,6 +1335,7 @@ function curDownload(kind){
 $("dl-rttm").onclick = () => curDownload("rttm");
 $("dl-log").onclick = () => curDownload("log");
 $("dl-json").onclick = () => curDownload("json");
+$("dl-audio").onclick = () => curDownload("audio");
 
 /* ================================================================
  * 服务器配置
@@ -1430,7 +1469,7 @@ async function startVpRecord(){
   } catch(err){ toast(t("micError") + ": " + err.message, "error"); return; }
   const Ctx = window.AudioContext || window.webkitAudioContext;
   const ctx = new Ctx({ sampleRate: 16000 });
-  if (ctx.state === "suspended") ctx.resume();  // 同上：避免录制静默
+  if (ctx.state === "suspended") ctx.resume().catch(() => {});  // 同上：避免录制静默
   vpRec = { ctx, stream, chunks: [], sr: ctx.sampleRate, startT: Date.now(), timer: null };
   try {
     const src = ctx.createMediaStreamSource(stream);

@@ -328,10 +328,10 @@ class StreamingSpeakerVerifier:
     2. 相似度 EMA 平滑，防止单 chunk 抖动
     3. 按模式决定标签替换规则：
        - verify（确认，默认）：连续 ``min_chunks`` 次平滑相似度 >= threshold
-         才确认替换；确认后持续不达标自动撤销、恢复 speakerX 标签
-       - identify（识别，open-set）：无 min_chunks 门禁，每 chunk 即时按
-         EMA 平滑后的 Top-1 匹配替换；相似度 < 门禁（默认同 threshold）
-         保持 speakerX，Top-1 变化时名字立即跟随
+         才确认替换；确认后持续不达标自动撤销、恢复 speakerX 标签。
+         输出匹配到的说话人名字
+       - identify（识别，open-set）：仅输出聚类代号 speakerX，不做人名
+         替换；识别结果（Top-1/Top-3）只写入元数据与日志，供 UI/诊断使用
 
     两种模式均可通过 :meth:`set_mode` 运行中切换，EMA 状态保留。
 
@@ -448,19 +448,20 @@ class StreamingSpeakerVerifier:
     ) -> dict[int, VerifiedSpeaker]:
         """用当前质心更新状态，返回当前模式的识别/确认映射。
 
-        verify 模式：未确认（未注册）不替换标签，误确认自动撤销恢复。
-        identify 模式：open-set 识别，每 chunk 即时输出 Top-1（EMA 平滑），
-        低于门禁保持 speakerX。
+        verify 模式：未确认（未注册）不替换标签，误确认自动撤销恢复，
+        确认后输出匹配到的说话人名字。
+        identify 模式：仅输出聚类代号 speakerX（不做人名替换），识别结果
+        写入元数据（identifications）与日志。
         """
-        if self._matrix.shape[0] == 0:
-            with self._lock:
+        # 空矩阵守卫与后续使用必须在同一把锁内：热重载（update_voiceprints）
+        # 可能并发清空矩阵，锁外 check-then-act 会让空矩阵进入 argmax/argpartition
+        with self._lock:
+            if self._matrix.shape[0] == 0:
                 return (
                     dict(self._confirmed)
                     if self.mode == "verify"
                     else dict(self._identifications)
                 )
-
-        with self._lock:
             topk = 3
             for g_spk in active_speakers:
                 if g_spk >= centers.shape[0]:
@@ -488,7 +489,6 @@ class StreamingSpeakerVerifier:
                     else:
                         state.ema = self.ema_alpha * best_sim + (1 - self.ema_alpha) * state.ema
                     self._state[g_spk] = state
-                    prev = self._identifications.get(g_spk)
                     self._identifications[g_spk] = VerifiedSpeaker(
                         name=state.name,
                         id=state.id,
@@ -498,13 +498,17 @@ class StreamingSpeakerVerifier:
                             for i in top_idx[1:]
                         ],
                     )
-                    # 识别结果变化时打印（与 verify 模式的确认/撤销打印同源）
+                    # 识别结果变化时打印（与 verify 模式的确认/撤销打印同源）：
+                    # 按实际标签转换（EMA 跨过门禁）打印，与 _build_rename_mapping
+                    # 的标签应用逻辑保持一致；prev_label 为上一 chunk 应用后的标签
                     new_label = (
                         state.name
                         if state.ema >= self.identify_gate
                         else f"speaker{g_spk}"
                     )
-                    if prev is None or prev.name != state.name:
+                    prev_label = self._label_state.get(g_spk)
+                    # 仅在实际标签转换时打印：首帧即 speakerX（无转换）不打印
+                    if prev_label is not None and prev_label != new_label:
                         print(
                             f"[声纹识别] speaker{g_spk} = {new_label} "
                             f"(相似度 {state.ema:.3f})"
@@ -581,15 +585,19 @@ class StreamingSpeakerVerifier:
                     mapping[old] = f"speaker{g_spk}"
                     self._label_state[g_spk] = f"speaker{g_spk}"
         else:
-            # identify：每 chunk 即时跟随 Top-1（open-set：低于门禁保持 speakerX）
+            # identify：仅输出聚类代号 speakerX，不做人名替换。
+            # 识别结果（Top-1/Top-3）保留在 _identifications 元数据中
+            # （speaker_verification 属性），供 UI/日志使用；_label_state
+            # 仅用于 update() 中识别变化的日志打印跟踪。
             gate = self.identify_gate
             for g_spk, verified in self._identifications.items():
-                new = verified.name if verified.similarity >= gate else f"speaker{g_spk}"
-                mapping[f"speaker{g_spk}"] = new
-                old = self._label_state.get(g_spk)
-                if old is not None and old != new:
-                    mapping[old] = new
+                new = (
+                    verified.name
+                    if verified.similarity >= gate
+                    else f"speaker{g_spk}"
+                )
                 self._label_state[g_spk] = new
+            return {}
         return mapping
 
     def rename_annotation(self, annotation) -> "Annotation":

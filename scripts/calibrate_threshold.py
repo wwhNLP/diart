@@ -219,6 +219,11 @@ def main():
 
     # 3. EER 计算
     result = compute_eer(same_sims, diff_sims)
+
+    def _fmt_frr(value):
+        """FAR 约束不满足时 frr 为 None，打印 N/A 而非崩溃。"""
+        return "N/A" if value is None else f"{value * 100:.1f}%"
+
     print(
         f"EER = {result['eer']*100:.1f}% @ 阈值 {result['eer_threshold']} "
         f"(FAR={result['far_at_eer']*100:.1f}%, FRR={result['frr_at_eer']*100:.1f}%)",
@@ -226,9 +231,9 @@ def main():
     )
     print(
         f"FAR≤1% 阈值 {result['threshold_far1']} "
-        f"(FRR={result['frr_at_threshold_far1']*100:.1f}%) | "
+        f"(FRR={_fmt_frr(result['frr_at_threshold_far1'])}) | "
         f"FAR≤5% 阈值 {result['threshold_far5']} "
-        f"(FRR={result['frr_at_threshold_far5']*100:.1f}%)",
+        f"(FRR={_fmt_frr(result['frr_at_threshold_far5'])})",
         flush=True,
     )
 

@@ -307,17 +307,20 @@ class SpeakerDiarization(base.Pipeline):
             agg_prediction = self.binarize(agg_prediction)
 
             # 流式说话人确认：匹配聚类质心 -> 重命名标签 -> 附确认信息
-            if self.verifier is not None and self.clustering.centers is not None:
-                self.verifier.update(
+            # 每 chunk 捕获局部引用：控制线程（WS 热重载）可能替换 self.verifier，
+            # 单 chunk 内使用一致引用，避免 check-then-act 竞态
+            verifier = self.verifier
+            if verifier is not None and self.clustering.centers is not None:
+                verifier.update(
                     self.clustering.centers, self.clustering.active_centers
                 )
-                agg_prediction = self.verifier.rename_annotation(agg_prediction)
+                agg_prediction = verifier.rename_annotation(agg_prediction)
             # 输出属性：verify 模式 -> 确认映射；identify 模式 -> Top-1 识别映射（含 top3）
-            if self.verifier is not None:
+            if verifier is not None:
                 source = (
-                    self.verifier.confirmed
-                    if self.verifier.mode == "verify"
-                    else self.verifier.identifications
+                    verifier.confirmed
+                    if verifier.mode == "verify"
+                    else verifier.identifications
                 )
                 self.verification = {
                     g_spk: {

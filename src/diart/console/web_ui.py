@@ -23,14 +23,18 @@
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import queue
 import shutil
+import struct
 import threading
 import time
 import uuid
 import webbrowser
+
+import numpy as np
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -60,6 +64,34 @@ def _wallclock() -> float:
 
 
 # --------------------------------------------------------------------------- #
+# 会话音频保存（16k 单声道 int16 WAV，流式写入）
+# --------------------------------------------------------------------------- #
+WAV_SAMPLE_RATE = 16000
+WAV_HEADER_SIZE = 44
+
+
+def wav_header(data_bytes: int, sample_rate: int = WAV_SAMPLE_RATE) -> bytes:
+    """构造 16-bit PCM mono WAV 头。"""
+    block_align = 2
+    byte_rate = sample_rate * block_align
+    return struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + data_bytes, b"WAVE",
+        b"fmt ", 16, 1, 1, sample_rate, byte_rate, block_align, 16,
+        b"data", data_bytes,
+    )
+
+
+def _pcm16_bytes(float32_bytes: bytes) -> bytes:
+    """float32 LE PCM -> int16 LE PCM（浏览器上传格式转换）。"""
+    samples = np.frombuffer(float32_bytes, dtype="<f4")
+    if samples.size == 0:
+        return b""
+    pcm16 = np.clip(samples, -1.0, 1.0)
+    return (pcm16 * 32767.0).astype("<i2").tobytes()
+
+
+# --------------------------------------------------------------------------- #
 # 会话：上游 diart 服务连接 + 日志落盘
 # --------------------------------------------------------------------------- #
 class Session:
@@ -86,6 +118,7 @@ class Session:
         self.ended_at: float | None = None
         self.num_messages = 0
         self.num_lines = 0
+        self.num_audio_in = 0
         self.messages: list[dict[str, Any]] = []  # [{t, text}] 供历史回放
 
         self._state = "idle"
@@ -102,11 +135,18 @@ class Session:
         self.rttm_path = log_dir / f"{sid}.rttm"
         self.log_path = log_dir / f"{sid}.log"
         self.json_path = log_dir / f"{sid}.json"
+        self.audio_path = log_dir / f"{sid}.wav"
+        self._audio_fh = None
+        self._audio_bytes = 0
 
     # -- 生命周期 -------------------------------------------------------- #
     def start(self) -> None:
         self._rttm_fh = open(self.rttm_path, "w", encoding="utf-8")
         self._log_fh = open(self.log_path, "w", encoding="utf-8")
+        # 流式保存会话音频：先写 WAV 头占位，结束时回填数据长度
+        self._audio_fh = open(self.audio_path, "wb")
+        self._audio_fh.write(wav_header(0))
+        self._audio_bytes = 0
         self._write_log_line(
             f"# diart 会话开始 [{self.mode}] -> {self.server_host}:{self.server_port}"
         )
@@ -135,10 +175,25 @@ class Session:
 
     # -- 音频上行 --------------------------------------------------------- #
     def send_audio(self, base64_data: str) -> None:
-        """浏览器音频块（base64 text）→ 上游。离线时暂存，重连后按序补发。"""
+        """浏览器音频块（base64 text）→ 上游。离线时暂存，重连后按序补发；
+        同时流式写入会话音频文件（WAV int16）。"""
         if self._stop_evt.is_set():
             return
-        self.num_audio_in = getattr(self, 'num_audio_in', 0) + 1
+        # 音频块计数（会话结束日志用；仅统计用途，无需严格原子）
+        self.num_audio_in += 1
+        # 保存音频（浏览器线程调用，与 finalize 用锁互斥）
+        try:
+            pcm16 = _pcm16_bytes(base64.b64decode(base64_data))
+        except Exception:
+            pcm16 = b""
+        if pcm16:
+            with self._lock:
+                if self._audio_fh is not None:
+                    self._audio_fh.write(pcm16)
+                    # 立即落盘：同进程片段回放 API 用独立文件对象读取，
+                    # 不 flush 会读不到缓冲中的最新数据（最多滞后 ~8KB）
+                    self._audio_fh.flush()
+                    self._audio_bytes += len(pcm16)
         while self._queue.full():
             try:
                 self._queue.get_nowait()
@@ -290,6 +345,13 @@ class Session:
                 if fh is not None:
                     fh.close()
             self._rttm_fh = self._log_fh = None
+            # 回填 WAV 头（数据长度），音频保持可读
+            if self._audio_fh is not None:
+                self._audio_fh.seek(0)
+                self._audio_fh.write(wav_header(self._audio_bytes))
+                self._audio_fh.close()
+                self._audio_fh = None
+        audio_seconds = round(self._audio_bytes / (WAV_SAMPLE_RATE * 2), 2)
         meta = {
             "id": self.sid,
             "mode": self.mode,
@@ -299,6 +361,8 @@ class Session:
             "duration": round(self.ended_at - self.started_at, 2),
             "num_messages": self.num_messages,
             "num_lines": self.num_lines,
+            "audio": audio_seconds > 0,
+            "audio_duration": audio_seconds,
             "messages": self.messages,
         }
         try:
@@ -310,7 +374,7 @@ class Session:
         self.emit({"type": "status", "state": "stopped", "session_id": self.sid})
         LOG.info(
             "会话 %s 结束：%d 条 RTTM 行，收到音频块 %d 个",
-            self.sid, self.num_lines, getattr(self, 'num_audio_in', 0),
+            self.sid, self.num_lines, self.num_audio_in,
         )
 
 
@@ -424,14 +488,18 @@ class WebConsole:
             return
         mtype = data.get("type")
         if mtype == "config":
+            # 先校验到局部变量再一起提交：避免 host 已更新而 port 校验失败
+            # 导致上下游地址不一致
             try:
-                self.server_host = str(data.get("server_host") or self.server_host)
-                self.server_port = int(data.get("server_port") or self.server_port)
+                host = str(data.get("server_host") or self.server_host)
+                port = int(data.get("server_port") or self.server_port)
             except (TypeError, ValueError):
                 await self._send(
                     ws, {"type": "error", "msg": "server_port 必须为数字"}
                 )
                 return
+            self.server_host = host
+            self.server_port = port
             await self._send(
                 ws,
                 {
@@ -535,6 +603,7 @@ class WebConsole:
                     "num_lines": meta.get("num_lines", 0),
                     "server": meta.get("server", ""),
                     "has_rttm": (self.log_dir / f"{jpath.stem}.rttm").exists(),
+                    "has_audio": bool(meta.get("audio")),
                 }
             )
         sessions.sort(key=lambda s: s.get("start") or 0, reverse=True)
@@ -578,8 +647,8 @@ class WebConsole:
 
         async def api_session_file(request: web.Request) -> web.Response:
             sid = request.match_info["sid"]
-            kind = request.match_info["kind"]  # rttm | json | log
-            fname = {"rttm": "rttm", "json": "json", "log": "log"}.get(kind)
+            kind = request.match_info["kind"]  # rttm | json | log | audio
+            fname = {"rttm": "rttm", "json": "json", "log": "log", "audio": "wav"}.get(kind)
             if fname is None:
                 raise web.HTTPNotFound()
             path = self.log_dir / f"{sid}.{fname}"
@@ -589,7 +658,18 @@ class WebConsole:
                 "rttm": "text/plain",
                 "json": "application/json",
                 "log": "text/plain",
+                "audio": "audio/wav",
             }[kind]
+            if kind == "audio":
+                raw = path.read_bytes()
+                # 进行中会话 WAV 头可能未回填（data size=0）：按实际数据长度重建
+                if len(raw) >= WAV_HEADER_SIZE:
+                    raw = wav_header(len(raw) - WAV_HEADER_SIZE) + raw[WAV_HEADER_SIZE:]
+                return web.Response(
+                    body=raw,
+                    content_type=ctype,
+                    headers={"Content-Disposition": f'attachment; filename="{path.name}"'},
+                )
             return web.Response(
                 text=path.read_text(encoding="utf-8"),
                 content_type=ctype,
@@ -599,13 +679,43 @@ class WebConsole:
         async def api_session_delete(request: web.Request) -> web.Response:
             sid = request.match_info["sid"]
             deleted = []
-            for ext in (".rttm", ".log", ".json"):
+            for ext in (".rttm", ".log", ".json", ".wav"):
                 p = self.log_dir / f"{sid}{ext}"
                 if p.exists():
                     p.unlink()
                     deleted.append(p.name)
             self._update_index()
             return web.json_response({"deleted": deleted})
+
+        # ---- 会话音频（时间轴片段回放 / 下载） ----
+        AUDIO_MAX_SLICE = 120.0  # 单次片段最大秒数
+
+        async def api_session_audio(request: web.Request) -> web.Response:
+            """GET /api/sessions/{sid}/audio?start=&end=：返回片段 WAV（时间轴回放）。
+
+            从会话音频文件切出 [start, end) 秒的 PCM，补 WAV 头返回；
+            支持会话进行中读取（文件头已由 Session 流式维护）。
+            """
+            path = self.log_dir / f"{request.match_info['sid']}.wav"
+            if not path.exists():
+                raise web.HTTPNotFound()
+            try:
+                start = max(0.0, float(request.query.get("start", 0)))
+                end = float(request.query.get("end", start + 30))
+            except ValueError:
+                raise web.HTTPBadRequest(text="start/end 必须为数字")
+            if end - start > AUDIO_MAX_SLICE:
+                end = start + AUDIO_MAX_SLICE
+            if end <= start:
+                raise web.HTTPBadRequest(text="end 必须大于 start")
+            with open(path, "rb") as f:
+                f.seek(WAV_HEADER_SIZE + int(start * WAV_SAMPLE_RATE) * 2)
+                data = f.read(int((end - start) * WAV_SAMPLE_RATE) * 2)
+            if not data:
+                raise web.HTTPRequestRangeNotSatisfiable(text="该片段无音频数据")
+            return web.Response(
+                body=wav_header(len(data)) + data, content_type="audio/wav"
+            )
 
         # ---- 临时声纹库（添加声纹 / 列表） ----
         VP_EXTS = {".wav", ".m4a", ".mp3", ".flac", ".amr"}
@@ -715,11 +825,10 @@ class WebConsole:
             spk_dir = self.temp_vp_dir / name
             try:
                 spk_dir.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
+            except OSError:
                 LOG.exception("创建声纹目录失败: %s", spk_dir)
-                return web.json_response(
-                    {"ok": False, "msg": f"创建目录失败: {exc}"}
-                )
+                # 不回传原始 OSError 文本：避免泄露服务器绝对路径
+                return web.json_response({"ok": False, "msg": "创建目录失败"})
             # 双保险：确认最终目录仍在临时库根目录下
             if not spk_dir.resolve().is_relative_to(
                 self.temp_vp_dir.resolve()
@@ -729,7 +838,11 @@ class WebConsole:
                 )
             filename = time.strftime("%Y%m%d_%H%M%S") + audio_ext
             path = spk_dir / filename
-            path.write_bytes(audio_data)
+            try:
+                path.write_bytes(audio_data)
+            except OSError:
+                LOG.exception("写入声纹文件失败: %s", path)
+                return web.json_response({"ok": False, "msg": "保存声纹音频失败"})
             LOG.info("声纹已保存: %s (%d bytes)", path, len(audio_data))
 
             # 通知 serve 热重载（会话在线时立即；否则记录待重载标记）
@@ -749,6 +862,7 @@ class WebConsole:
         app.router.add_get("/api/sessions", api_sessions)
         app.router.add_get("/api/sessions/{sid}", api_session_detail)
         app.router.add_get("/api/sessions/{sid}/files/{kind}", api_session_file)
+        app.router.add_get("/api/sessions/{sid}/audio", api_session_audio)
         app.router.add_delete("/api/sessions/{sid}", api_session_delete)
         app.router.add_get("/api/voiceprints", api_voiceprints_list)
         app.router.add_post("/api/voiceprints", api_voiceprints_add)
@@ -837,7 +951,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="verify",
         type=str,
         choices=["verify", "identify"],
-        help="默认说话人模式：verify=确认 / identify=识别（open-set）。"
+        help="默认说话人模式：verify=确认（输出匹配人名）/ identify=识别（仅输出代号）。"
         "运行中可在页面切换（需上游 serve 支持，serve 需以对应 --verify-mode 启动）",
     )
     parser.add_argument(

@@ -1,6 +1,13 @@
 import argparse
 import os
 from pathlib import Path
+import torch
+
+from diart import argdoc, utils
+from diart import models as m
+from diart import sources as src
+from diart.inference import StreamingInference
+from diart.sinks import RTTMWriter
 
 DEFAULT_HF_ENDPOINT = "https://hf-mirror.com"
 
@@ -55,13 +62,6 @@ _pre_connectivity.add_argument(
 _pre_args, _ = _pre_parser.parse_known_args()
 _apply_environment(_pre_args.hf_endpoint, _pre_args.offline)
 
-import torch
-
-from diart import argdoc, utils
-from diart import models as m
-from diart import sources as src
-from diart.inference import StreamingInference
-from diart.sinks import RTTMWriter
 
 
 def run():
@@ -204,8 +204,9 @@ def run():
         default="verify",
         type=str,
         choices=["verify", "identify"],
-        help="说话人模式：verify=确认（阈值门禁，默认）；identify=识别（open-set，"
-        "即时 Top-1 替换，低于门禁保持 speakerX）。运行中可通过 WS 控制消息切换",
+        help="说话人模式：verify=确认（阈值门禁，确认后输出匹配人名，默认）；"
+        "identify=识别（open-set，仅输出聚类代号 speakerX，识别结果走元数据/日志）。"
+        "运行中可通过 WS 控制消息切换",
     )
     args = parser.parse_args()
     if not args.verify:
